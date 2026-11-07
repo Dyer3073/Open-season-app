@@ -1,0 +1,1 @@
+{"description":"Open Season — private invite-only league app for Da Boyz. Zero-dependency Node.js server.","engines":{"node":">=20"},"main":"server.js","name":"open-season-private-group-app","private":true,"scripts":{"dev":"node --watch server.js","start":"node server.js"},"type":"commonjs","version":"1.0.0"}

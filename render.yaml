@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: open-season
+    runtime: node # or deploy via the included Dockerfile (runtime: docker)
+    plan: free
+    buildCommand: npm install --omit=dev # no dependencies — this is effectively a no-op
+    startCommand: npm start
+    envVars:
+      - key: LEAGUE_CODE
+        value: BOYZ-2027
+      - key: DATA_DIR
+        value: /var/data
+      # Founder emergency reset code — set your own secret value in the Render
+      # dashboard (do NOT commit a real one). POST /api/admin/founder-reset
+      # with { resetCode } clears every other player's claim/PIN.
+      - key: ADMIN_RESET_CODE
+        sync: false
+      # Optional: override the Season 1 go-live instant (ISO, UTC).
+      # Default is 2027-01-01T05:00:00.000Z (midnight EST, Jan 1 2027).
+      - key: SEASON_START_ISO
+        sync: false
+    # ⚠ FREE-TIER WARNING: Render's free web services have an EPHEMERAL disk.
+    # Without the disk block below (paid, ~$0.25/GB/mo) — or moving lib/store.js
+    # to a hosted database — all league data (claims, XP, chat) is LOST on every
+    # restart/redeploy/spin-down. Uncomment to attach a persistent disk:
+    # disk:
+    #   name: open-season-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

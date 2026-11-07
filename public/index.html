@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Open Season — Da Boyz</title>
+<meta name="theme-color" content="#0a0a0a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Open Season">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ── Login / claim ── -->
+<section id="loginView">
+  <div class="logo"> ◎ </div>
+  <h1>OPEN SEASON</h1>
+  <p class="tag">DA BOYZ — PRIVATE LEAGUE</p>
+  <div class="card">
+    <label>Pick your name</label>
+    <select id="loginPlayer"></select>
+    <label>League code <span class="hint">(first time — claiming your spot)</span></label>
+    <input id="loginCode" type="text" placeholder="BOYZ-2027" autocomplete="off">
+    <label>PIN <span class="hint">(set it when you claim; use it to log back in)</span></label>
+    <input id="loginPin" type="password" inputmode="numeric" placeholder="4+ characters">
+    <button id="claimBtn" class="primary">Claim my spot</button>
+    <button id="loginBtn" class="ghost">I already claimed — log in</button>
+    <p id="loginError" class="error"></p>
+  </div>
+  <p class="fineprint">Invite only. Your location is only ever visible inside this league, and only while you share it.</p>
+</section>
+
+<!-- ── App ── -->
+<section id="appView" hidden>
+  <header>
+    <div class="brand">◎ OPEN SEASON</div>
+    <div id="seasonLine" class="season-line"></div>
+    <div id="countdown" class="countdown"></div>
+    <div id="meBar" class="me-bar"></div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="map" class="active">Map</button>
+    <button data-tab="board">Board</button>
+    <button data-tab="chat">Chat</button>
+    <button data-tab="me">My Card</button>
+    <button data-tab="rules">Rules</button>
+  </nav>
+
+  <main>
+    <!-- MAP -->
+    <div class="pane" id="pane-map">
+      <div class="row between">
+        <label class="switch-row"><span>Location sharing</span></label>
+        <label class="switch"><input type="checkbox" id="shareToggle"><span class="track"></span></label>
+      </div>
+      <p id="shareNote" class="hint"></p>
+      <div id="map"></div>
+      <div id="mapFallback" hidden></div>
+      <div id="hunterList"></div>
+      <div class="card">
+        <h3>My safe zones</h3>
+        <p class="hint">Inside a safe zone your pin hides automatically (~150 m). Set one where you are standing, or type coordinates.</p>
+        <div id="zoneList"></div>
+        <div class="row">
+          <select id="zoneLabel"><option value="home">Home</option><option value="work">Work</option><option value="church">Church</option></select>
+          <button id="zoneHereBtn" class="ghost small">Use my location</button>
+        </div>
+        <div class="row">
+          <input id="zoneLat" type="text" inputmode="decimal" placeholder="Latitude">
+          <input id="zoneLng" type="text" inputmode="decimal" placeholder="Longitude">
+          <button id="zoneAddBtn" class="primary small">Save zone</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- BOARD -->
+    <div class="pane" id="pane-board" hidden>
+      <div id="actionCenter"></div>
+      <h3>Hunt Board — Season <span class="seasonNum"></span></h3>
+      <div id="huntBoard"></div>
+      <h3>Career XP Leaderboard</h3>
+      <div id="careerBoard"></div>
+    </div>
+
+    <!-- CHAT -->
+    <div class="pane" id="pane-chat" hidden>
+      <div class="card">
+        <h3>Claim a kill</h3>
+        <div class="row">
+          <select id="killVictim"></select>
+          <label class="check"><input type="checkbox" id="killStealth"> Stealth</label>
+          <button id="killBtn" class="primary small">Claim</button>
+        </div>
+        <p id="killNote" class="hint"></p>
+      </div>
+      <div id="feed"></div>
+      <div class="chat-input">
+        <input id="chatText" type="text" placeholder="Message the league…" maxlength="1000">
+        <button id="chatSend" class="primary">Send</button>
+      </div>
+    </div>
+
+    <!-- MY CARD -->
+    <div class="pane" id="pane-me" hidden>
+      <div id="myCard"></div>
+      <div class="card" id="reversePanel"></div>
+      <button id="logoutBtn" class="ghost">Log out</button>
+    </div>
+
+    <!-- RULES -->
+    <div class="pane" id="pane-rules" hidden>
+      <div id="adminPanel"></div>
+      <div class="card" id="rulesCard"></div>
+    </div>
+  </main>
+</section>
+
+<div id="toast" hidden></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
