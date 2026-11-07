@@ -88,7 +88,7 @@ function drawMap() {
     $('#map').hidden = false; $('#mapFallback').hidden = true;
     if (!map) {
       map = L.map('map').setView(center, 12);
-      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { attribution: '© OpenStreetMap © CARTO', maxZoom: 19 }).addTo(map);
+      L.tileLayer('https://{s}.`tile.openstreetmap.org/{z}/{x}/{y}.png`,/{z}/{x}/{y}{r}.png', { attribution: '© OpenStreetMap © CARTO', maxZoom: 19 }).addTo(map);
     }
     markers.forEach(m => map.removeLayer(m)); markers = [];
     const zoneLayer = (S.me.safeZones || []).forEach(z => markers.push(L.circle([z.lat, z.lng], { radius: z.radius, color: '#f96d00', fillColor: '#f96d00', fillOpacity: 0.1 }).addTo(map)));
