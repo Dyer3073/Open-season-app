@@ -11,12 +11,38 @@ function toast(msg, ms = 3200) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
   setTimeout(() => { t.hidden = true; }, ms);
 }
+// BEGIN dead-session handling (Round 10)
+// The server keeps ONE live token per player: a login on a second
+// device, a founder reset, or a league restore retires the token this
+// device holds. Before this fix the client swallowed the resulting 401s
+// forever — refresh() and the position posts are catch-and-ignore — so
+// the app looked perfectly normal while the server rejected everything,
+// and a hunter could believe he had checked in to a Location Check the
+// server never saw (and be eliminated for it). Now a 401 received while
+// holding a token clears the dead token and reloads ONCE into the
+// login/claim view (the boot path falls back there on its own once no
+// token is stored). The sessionStorage stamp is the loop guard: if we
+// already reloaded moments ago, we do not reload again.
+let deadSessionHandled = false;
+function handleDeadSession() {
+  if (deadSessionHandled) return;
+  deadSessionHandled = true;
+  token = '';
+  try { localStorage.removeItem('os_token'); } catch (e) { /* storage may be unavailable */ }
+  let last = 0;
+  try { last = Number(sessionStorage.getItem('os_dead_session_at') || 0); } catch (e) { /* ignore */ }
+  if (Date.now() - last < 10000) return; // reloaded for this moments ago — never loop
+  try { sessionStorage.setItem('os_dead_session_at', String(Date.now())); } catch (e) { /* ignore */ }
+  location.reload();
+}
+// END dead-session handling
 async function api(path, method = 'GET', body) {
   const r = await fetch(path, {
     method,
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (r.status === 401 && token) handleDeadSession();
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
   return data;
@@ -119,6 +145,68 @@ function enterApp(state) {
   $('#loginView').hidden = true; $('#appView').hidden = false;
   render(); startLoops();
 }
+
+// ── field preservation (Round 9) ──
+// render() rebuilds panels with innerHTML on every state poll (15 s), the
+// 60 s countdown tick, and after GPS posts. Rebuilding a panel destroys any
+// input inside it: an admin halfway through typing a bounty amount (or a
+// hunter editing his callsign) lost the text AND the focus within seconds.
+// preserveFields() snapshots a panel's field values + focus before the
+// rebuild and restores them after, so typing survives re-renders.
+//
+// BEGIN field preservation core (pure — Suite 11 evals this block verbatim)
+const FIELD_PRESERVE_SKIP = new Set(['checkbox', 'radio', 'file']);
+// Plain records in ({id, kind, value}) → plain {id: value} map out.
+// Checkbox/radio/file inputs are skipped on purpose: toggles render from
+// server/local state and resurrecting a stale one could override a
+// deliberate change; a file input's value can never be written back anyway.
+function collectPreservable(records) {
+  const values = {};
+  for (const r of records || []) {
+    if (!r || !r.id || FIELD_PRESERVE_SKIP.has(r.kind)) continue;
+    values[r.id] = r.value;
+  }
+  return values;
+}
+// Which snapshotted values may be written back: only fields that still
+// exist after the rebuild (a panel can legitimately change shape — e.g.
+// the Location Check form swaps for the running-call view when a call
+// starts, and its inputs are simply gone).
+function planRestore(values, existingIds) {
+  const have = new Set(existingIds || []);
+  return Object.keys(values || {}).filter(id => have.has(id)).map(id => ({ id, value: values[id] }));
+}
+// END field preservation core
+
+// BEGIN field preservation adapter (DOM — Suite 11 drives it with a fake DOM)
+function preserveFields(root, rebuild) {
+  if (!root) { rebuild(); return; }
+  const SEL = 'input[id], textarea[id], select[id]';
+  const before = [...root.querySelectorAll(SEL)];
+  const values = collectPreservable(before.map(el => ({ id: el.id, kind: el.type || el.tagName.toLowerCase(), value: el.value })));
+  const ae = document.activeElement;
+  const focusId = ae && ae.id && root.contains(ae) ? ae.id : null;
+  let selStart = null, selEnd = null;
+  if (focusId && focusId in values) {
+    // Only text-like fields carry a selection; number/select elements
+    // report null/undefined and some browsers throw — all handled.
+    try { selStart = ae.selectionStart; selEnd = ae.selectionEnd; } catch (_) { /* leave null */ }
+    if (selStart == null) { selStart = null; selEnd = null; }
+  }
+  rebuild();
+  const fresh = {};
+  root.querySelectorAll(SEL).forEach(el => { fresh[el.id] = el; });
+  for (const { id, value } of planRestore(values, Object.keys(fresh))) {
+    const el = fresh[id];
+    if (el && el.value !== value) el.value = value;
+  }
+  if (focusId && fresh[focusId]) {
+    const el = fresh[focusId];
+    try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (_) { /* detached */ } }
+    if (selStart != null) { try { el.setSelectionRange(selStart, selEnd); } catch (_) { /* non-text field */ } }
+  }
+}
+// END field preservation adapter
 
 // ── render ──
 function render() {
@@ -246,6 +334,10 @@ const BANNER_KINDS = ['kill', 'bounty', 'duck', 'achievement', 'cancel', 'danger
 const REACTS = ['🔥', '🦆', '🏆', '😂'];
 function renderChat() {
   const fid = $('#feed');
+  // Round 10: only follow the feed to the bottom when the hunter is
+  // already reading at (or near) the bottom — a re-render landing while
+  // he is scrolled up through history must not yank him back down.
+  const nearBottom = fid.scrollHeight - fid.scrollTop - fid.clientHeight < 120;
   fid.innerHTML = S.messages.map(m => {
     const author = m.playerId ? playerOf(m.playerId) : null;
     const who = author ? `${insigniaSvg(author.rank, 13)} ${avatarHtml(author, 13)}${escapeHtml(displayName(author))}` : 'OPEN SEASON';
@@ -258,10 +350,17 @@ function renderChat() {
     }).join('')}</div>`;
     return `<div class="msg ${m.kind}${banner}"><span class="when">${fmtTime(m.ts)}</span><span class="who">${who}</span> — ${escapeHtml(m.text)}${photo}${reacts}</div>`;
   }).join('');
-  fid.scrollTop = fid.scrollHeight;
+  if (nearBottom) fid.scrollTop = fid.scrollHeight;
   const me = S.me, L = S.league, open = L.phase === 'live' || L.scrimmage;
   const targets = S.players.filter(p => !p.watching && p.id !== me.id && p.alive && !p.out && !p.immuneUntil && !p.driving);
-  $('#killVictim').innerHTML = targets.map(p => `<option value="${p.id}">${escapeHtml(displayName(p))}</option>`).join('');
+  // Round 10: rebuilding the options used to reset the select to the
+  // first target — a hunter who had picked his victim (and attached a
+  // proof photo) could silently end up claiming the WRONG man after any
+  // re-render. Keep the chosen victim while he is still a valid target.
+  const victimSel = $('#killVictim');
+  const prevVictim = victimSel.value;
+  victimSel.innerHTML = targets.map(p => `<option value="${p.id}">${escapeHtml(displayName(p))}</option>`).join('');
+  if (prevVictim && targets.some(p => p.id === prevVictim)) victimSel.value = prevVictim;
   $('#killBtn').disabled = !open || !me.alive || me.out || me.watching;
   $('#killNote').textContent = L.scrimmage ? '🏋 SCRIMMAGE is on — claims are open for practice. Nothing counts: no XP, no real outs.' : L.phase !== 'live' ? 'Kill claims unlock when the season goes live (Jan 1, 2027).' : me.watching ? 'Watching members do not hunt.' : !me.alive || me.out ? 'You are out for this season.' : 'Your target confirms or disputes. Stealth keeps your name hidden until confirmation. Immune hunters (🛡) and driving hunters (🚗) can\'t be claimed on.';
 }
@@ -418,6 +517,10 @@ function renderHunt() {
 }
 function renderMe() {
   const me = S.me;
+  // Round 9: every My Card sub-panel is rebuilt below — wrap the whole
+  // pane so typed values + focus (the callsign input in #cancelPanel)
+  // survive the rebuild.
+  preserveFields($('#pane-me'), () => {
   renderHunt();
   renderPing();
   renderChecklist();
@@ -434,6 +537,7 @@ function renderMe() {
     <p class="hint">One tap copies the join message — paste it into the group chat.</p>
     <button class="ghost" onclick="copyInvite()">📋 Copy invite message</button>`;
   renderAlerts();
+  });
 }
 async function saveProfile() {
   try { const d = await api('/api/profile', 'POST', { callsign: $('#myCallsign').value }); S = d.state; render(); toast('Callsign saved.'); } catch (e) { toast(e.message); }
@@ -462,6 +566,10 @@ function renderAdmin() {
   if (me.role !== 'Founder' && me.role !== 'Vice') { el.innerHTML = ''; return; }
   const L = S.league;
   const opts = S.players.filter(p => !p.watching).map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+  // Round 9: the panel is rebuilt wholesale on every render — preserve
+  // typed values + focus (platform, bounty amount/note, check settings…)
+  // across the rebuild so the Founder can actually type in it.
+  preserveFields(el, () => {
   el.innerHTML = `<div class="card"><h3>Founder / Vice controls</h3>
     <label>Platform</label><input id="admPlatform" value="${L.platform || ''}" placeholder="Nerf / airsoft / water / foam">
     <label>Class</label><input id="admClass" value="${L.weaponClass || ''}" placeholder="Handguns / Rifles / Snipers / Shotguns / Explosives / Melee">
@@ -507,6 +615,7 @@ function renderAdmin() {
     <input type="file" id="admRestoreFile" accept="application/json,.json" hidden onchange="restorePicked(this)">
     <button class="danger" onclick="document.getElementById('admRestoreFile').click()">⬆ Restore from backup</button>
     <p class="hint">Restoring REPLACES the entire current league with the backup — there is no undo. Download a backup of the current league first if you might want it back.</p></div>`;
+  });
 }
 function renderRules() {
   const myAch = S.me.achievements || [];

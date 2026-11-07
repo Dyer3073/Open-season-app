@@ -58,6 +58,39 @@
 // window, sub, ES256 signature) in an isolated subprocess. Sends stay on
 // localhost; the Apple-shaped check only mints a JWT, it sends nothing.
 //
+// Round 9 adds Suite 11: the client field-preservation fix — render()
+// rebuilds panels with innerHTML on every poll (15 s), the 60 s tick, and
+// GPS posts, which destroyed any input being typed in (the Founder could
+// not type in his own admin controls: focus lost, text gone). The suite
+// statically asserts renderAdmin/renderMe route their rebuilds through
+// preserveFields and that renderChat never touches the chat composer
+// (a static element outside the rebuilt #feed), then evals the helper's
+// marked pure core verbatim out of the shipped app.js and drives the DOM
+// adapter against a light fake DOM: typed values + focus + caret survive
+// a rebuild, checkbox/radio/file inputs are never resurrected, and a
+// field the rebuild legitimately drops is skipped quietly.
+//
+// Round 10 adds Suite 12: the hardening round — regression tests for a
+// probe-verified audit. Scrimmage can no longer start during a live
+// season (and a live-season scrimmage flag found at load/render is
+// auto-ended exactly once); a kill confirms exactly once (double-claims
+// are superseded/auto-rejected, never double-paid); restores must match
+// THIS league's roster and include a Founder; close-season is live-only
+// with the next start rolled from the closed season's own start and no
+// Deadliest Man at 0 kills; PIN login is throttled (8 fails / 10 min →
+// 10-min lock) and PINs are scrypt-hashed with legacy SHA-256 hashes
+// still verifying and upgrading on login; push subscription endpoints
+// are allowlisted (the suite's localhost fakes run under the
+// PUSH_ALLOW_INSECURE_ENDPOINTS=1 escape hatch — see startServer — and
+// one Suite 12 instance turns it back off to prove the guard); a corrupt
+// data.json is quarantined, never overwritten, and saves keep a
+// throttled last-good .bak; coordinates/radii are finite-and-ranged; the
+// client clears a dead session on 401 instead of zombie-ing; the kill
+// victim select survives re-renders and the feed only autoscrolls at
+// the bottom; plus the minor admin guards (watching targets, dead /
+// unclaimed bounty targets, unclaimed victims, integer XP adjusts,
+// no-cache app assets, numeric normalize defaults).
+//
 // Run:  node tests/run-tests.js
 // Spawns throwaway servers on scratch ports with temp DATA_DIRs. No network
 // beyond localhost. Exits non-zero if any check fails.
@@ -81,7 +114,14 @@ async function startServer(port, seasonStartIso, extraEnv = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'os-test-'));
   const child = spawn('node', ['server.js'], {
     cwd: APP_DIR,
-    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, SEASON_START_ISO: seasonStartIso, ...extraEnv },
+    // PUSH_ALLOW_INSECURE_ENDPOINTS=1 (Round 10 adaptation): the server
+    // now refuses push subscription endpoints that are not recognized
+    // push services (SSRF guard), and these suites subscribe against a
+    // localhost fake push service by design — so the suite opts into the
+    // documented test-only escape hatch here. Suite 12 overrides it back
+    // to '0' on its own instance to prove the guard itself. Production
+    // never sets this variable.
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, SEASON_START_ISO: seasonStartIso, PUSH_ALLOW_INSECURE_ENDPOINTS: '1', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stderr.on('data', d => process.stderr.write(`[server ${port}] ${d}`));
@@ -389,7 +429,17 @@ async function suiteLive() {
     check('close: wilber 75 + 500 last-man + 25 last-man ach + 25 survivor = 625', me(st, C).xp === 625, me(st, C).xp);
     check('close: david 425 + 250 deadliest + 25 deadliest ach + 25 survivor = 725', me(st, A).xp === 725, me(st, A).xp);
     check('close: memphis 775 + 25 survivor = 800; vice survivor 25; korben untouched at 50', me(st, D).xp === 800 && me(st, V).xp === 25 && me(st, B).xp === 50, [me(st, D).xp, me(st, V).xp, me(st, B).xp]);
-    check('close: season increments, board resets, cards restored, phase back to setup', st.league.season === 2 && st.kills.length === 0 && st.players.every(p => p.alive && p.seasonKills === 0 && p.immuneUntil === null) && st.me.killCancelCard === true && st.league.phase === 'setup');
+    check('close: season increments, board resets, cards restored', st.league.season === 2 && st.kills.length === 0 && st.players.every(p => p.alive && p.seasonKills === 0 && p.immuneUntil === null) && st.me.killCancelCard === true);
+    // Round 10 adaptation: the next seasonStart is now the Jan 1 after
+    // the CLOSED season's own start (this fixture's season started
+    // 2000-01-01, so season 2 starts 2001-01-01) — not "next calendar
+    // year from today", which was the old behavior this check asserted
+    // via phase === 'setup'. For this fixture 2001 is in the past, so
+    // the league is immediately live again; on the real calendar
+    // (season starting 2027) the next start is in the future and the
+    // phase returns to setup exactly as before.
+    check('close: next season starts on the Jan 1 after the closed season\'s own start',
+      st.league.seasonStart === '2001-01-01T05:00:00.000Z' && st.league.phase === 'live', [st.league.seasonStart, st.league.phase]);
     check('close: achievement feed banners exist', st.messages.some(m => m.kind === 'achievement'));
     check('close: wilber achievement ledger entries = 5', achEntries(st, C).length === 5, achEntries(st, C).map(e => e.note));
 
@@ -1423,6 +1473,464 @@ async function suitePushHotfix() {
   } finally { child.kill(); fake.close(); }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+async function suiteFieldPreservation() {
+  suite('Suite 11 — client field preservation across re-renders (Round 9)');
+  const src = fs.readFileSync(path.join(APP_DIR, 'public', 'app.js'), 'utf8');
+
+  // ── static: the helper exists and both rebuild paths route through it ──
+  check('app.js defines the preservation helper (collectPreservable / planRestore / preserveFields)',
+    src.includes('function collectPreservable(') && src.includes('function planRestore(') && src.includes('function preserveFields('));
+  const adminBody = src.slice(src.indexOf('function renderAdmin()'), src.indexOf('function renderRules()'));
+  check('renderAdmin routes its innerHTML rebuild through preserveFields',
+    adminBody.includes('preserveFields(el, () => {') && adminBody.includes('el.innerHTML = `'));
+  const meBody = src.slice(src.indexOf('function renderMe()'), src.indexOf('async function saveProfile()'));
+  check('renderMe wraps the My Card rebuilds in preserveFields',
+    meBody.includes("preserveFields($('#pane-me'), () => {"));
+  const chatBody = src.slice(src.indexOf('function renderChat()'), src.indexOf('async function reactTo('));
+  check('renderChat never touches the chat composer (#chatText is static HTML outside the rebuilt #feed)',
+    !chatBody.includes('chatText') && !chatBody.includes('chat-input'));
+
+  // ── the pure core + DOM adapter, evaled verbatim out of the shipped file ──
+  const coreSlice = src.slice(src.indexOf('// BEGIN field preservation core'), src.indexOf('// END field preservation core'));
+  const adapterSlice = src.slice(src.indexOf('// BEGIN field preservation adapter'), src.indexOf('// END field preservation adapter'));
+  check('the marked core + adapter blocks are present for extraction',
+    coreSlice.length > 100 && adapterSlice.length > 100, { core: coreSlice.length, adapter: adapterSlice.length });
+  let F = null;
+  try { F = new Function('document', coreSlice + '\n' + adapterSlice + '\nreturn { collectPreservable, planRestore, preserveFields };'); } catch (e) { /* asserted below */ }
+  check('the extracted helper code parses standalone', typeof F === 'function');
+  if (F) {
+    const pure = F({ activeElement: null });
+    const values = pure.collectPreservable([
+      { id: 'admPlatform', kind: 'text', value: 'Airsoft' },
+      { id: 'admPot', kind: 'number', value: '25' },
+      { id: 'admMarked', kind: 'select-one', value: 'isaiah-twigg' },
+      { id: 'myCallsign', kind: 'text', value: 'Reaper' },
+      { id: 'someToggle', kind: 'checkbox', value: 'on' },
+      { id: 'someRadio', kind: 'radio', value: 'x' },
+      { id: 'admRestoreFile', kind: 'file', value: 'C:\\fakepath\\b.json' },
+      { kind: 'text', value: 'no id' },
+      null,
+    ]);
+    check('core: text/number/select values are collected keyed by id',
+      values.admPlatform === 'Airsoft' && values.admPot === '25' && values.admMarked === 'isaiah-twigg' && values.myCallsign === 'Reaper', values);
+    check('core: checkbox/radio/file records are skipped — a stale toggle can never be resurrected',
+      !('someToggle' in values) && !('someRadio' in values) && !('admRestoreFile' in values), Object.keys(values));
+    check('core: id-less and null records are ignored', Object.keys(values).length === 4, Object.keys(values));
+    const plan = pure.planRestore(values, ['admPlatform', 'admMarked']);
+    check('core: planRestore writes back only fields that still exist after the rebuild',
+      plan.length === 2 && plan.find(p => p.id === 'admPlatform').value === 'Airsoft' && plan.find(p => p.id === 'admMarked').value === 'isaiah-twigg', plan);
+    check('core: planRestore of an empty snapshot is an empty plan',
+      Array.isArray(pure.planRestore({}, ['admPlatform'])) && pure.planRestore({}, ['admPlatform']).length === 0);
+
+    // ── the DOM adapter against a light fake DOM ──
+    const fakeEl = (id, type, value) => ({
+      id, type, value, selectionStart: null, selectionEnd: null, focused: false, selRange: null,
+      focus() { this.focused = true; },
+      setSelectionRange(a, b) { this.selRange = [a, b]; },
+    });
+    const fakeRoot = els => ({ els, querySelectorAll() { return this.els; }, contains(el) { return this.els.includes(el); } });
+
+    // Mid-typing in the platform field; the rebuild hands back fresh
+    // elements with server-rendered values, drops the check-interval
+    // field entirely, and carries fresh toggle/file state.
+    const platform = fakeEl('admPlatform', 'text', 'Airsoft'); platform.selectionStart = 3; platform.selectionEnd = 5;
+    const root = fakeRoot([
+      platform,
+      fakeEl('admPot', 'number', '25'),
+      fakeEl('admMarked', 'select-one', 'isaiah-twigg'),
+      fakeEl('someToggle', 'checkbox', 'stale'),
+      fakeEl('admRestoreFile', 'file', 'C:\\fakepath\\backup.json'),
+      fakeEl('admCheckInterval', 'number', '15'),
+    ]);
+    const api = F({ activeElement: platform });
+    const nPlatform = fakeEl('admPlatform', 'text', '');
+    const nPot = fakeEl('admPot', 'number', '0');
+    const nMarked = fakeEl('admMarked', 'select-one', '');
+    const nToggle = fakeEl('someToggle', 'checkbox', 'fresh');
+    const nFile = fakeEl('admRestoreFile', 'file', '');
+    let threw = null;
+    try { api.preserveFields(root, () => { root.els = [nPlatform, nPot, nMarked, nToggle, nFile]; }); } catch (e) { threw = e; }
+    check('adapter: a rebuild mid-typing throws nothing (a snapshotted field vanished too)', !threw, threw && threw.message);
+    check('adapter: the typed text is restored into the rebuilt field', nPlatform.value === 'Airsoft', nPlatform.value);
+    check('adapter: number and select values are restored by id', nPot.value === '25' && nMarked.value === 'isaiah-twigg', { pot: nPot.value, marked: nMarked.value });
+    check('adapter: the fresh checkbox state is left alone — no stale toggle resurrection', nToggle.value === 'fresh', nToggle.value);
+    check('adapter: the file input is never written back', nFile.value === '', nFile.value);
+    check('adapter: focus returns to the field being typed in, caret restored',
+      nPlatform.focused === true && JSON.stringify(nPlatform.selRange) === '[3,5]', { focused: nPlatform.focused, selRange: nPlatform.selRange });
+
+    // Focus sat in a field the rebuild removed → nothing refocuses, no throw.
+    const gone = fakeEl('admCheckInterval', 'number', '20'); gone.selectionStart = 1; gone.selectionEnd = 1;
+    const root2 = fakeRoot([gone]);
+    const api2 = F({ activeElement: gone });
+    const survivor = fakeEl('admPlatform', 'text', '');
+    threw = null;
+    try { api2.preserveFields(root2, () => { root2.els = [survivor]; }); } catch (e) { threw = e; }
+    check('adapter: focus in a field the rebuild removed — no throw, nothing steals focus',
+      !threw && survivor.focused === false, { threw: threw && threw.message, focused: survivor.focused });
+
+    // Nothing focused → values still preserved, no field grabs focus.
+    const root3 = fakeRoot([fakeEl('myCallsign', 'text', 'Reaper')]);
+    const api3 = F({ activeElement: null });
+    const nCs = fakeEl('myCallsign', 'text', '');
+    api3.preserveFields(root3, () => { root3.els = [nCs]; });
+    check('adapter: with nothing focused, values restore and no field grabs focus',
+      nCs.value === 'Reaper' && nCs.focused === false, { value: nCs.value, focused: nCs.focused });
+  }
+
+  // ── the served copy carries the fix ──
+  const { child, base } = await startServer(3425, '2027-01-01T05:00:00.000Z');
+  try {
+    const r = await fetch(base + '/app.js');
+    const served = await r.text();
+    check('the served /app.js carries the preservation helper',
+      r.status === 200 && served.includes('function preserveFields(') && served.includes('function collectPreservable('), r.status);
+  } finally { child.kill(); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+async function suiteHardening() {
+  suite('Suite 12 — hardening: scrimmage lockout, single-confirm kills, restore identity, close guards, PIN throttle + scrypt, push SSRF, corrupt store, coordinates, client session/feed fixes, minor guards (Round 10)');
+  const LOGAN = 'logan-vance';
+
+  // ── Part A: live season — scrimmage lockout, double-confirm, guards ──
+  {
+    const { child, base } = await startServer(3430, '2000-01-01T05:00:00.000Z');
+    try {
+      const tF = await claim(base, F), tV = await claim(base, V), tA = await claim(base, A),
+        tB = await claim(base, B), tC = await claim(base, C), tD = await claim(base, D), tW = await claim(base, WATCH);
+
+      let r = await req(base, tF, 'POST', '/api/admin/scrimmage', { on: true });
+      check('scrimmage: starting one during the LIVE season → 400', r.status === 400 && /setup/i.test(r.json.error || ''), [r.status, r.json.error]);
+
+      // a real kill lands, then the lockout is what protects it
+      const k1 = await req(base, tA, 'POST', '/api/kills', { victimId: B, stealth: false });
+      await req(base, tB, 'POST', `/api/kills/${k1.json.kill.id}/confirm`, {});
+      let st = (await req(base, tF, 'GET', '/api/state')).json;
+      const xpAAfterKill = me(st, A).xp;
+      check('lockout setup: the real kill stands (victim dead, killer paid)', me(st, B).alive === false && xpAAfterKill > 0, [me(st, B).alive, xpAAfterKill]);
+      r = await req(base, tF, 'POST', '/api/admin/scrimmage', { on: true });
+      st = (await req(base, tF, 'GET', '/api/state')).json;
+      check('scrimmage: still refused with a real kill on the board — kill, death and XP all intact',
+        r.status === 400 && st.league.scrimmage === false && st.kills.length === 1 && st.kills[0].status === 'confirmed' &&
+        me(st, B).alive === false && me(st, A).xp === xpAAfterKill, [r.status, st.kills.length, me(st, A).xp, xpAAfterKill]);
+
+      // double-confirm, path 1: two PENDING claims on one victim
+      const kc1 = await req(base, tD, 'POST', '/api/kills', { victimId: C, stealth: false });
+      const kc2 = await req(base, tA, 'POST', '/api/kills', { victimId: C, stealth: false });
+      check('double-claim setup: two killers can hold pending claims on one victim', kc1.status === 200 && kc2.status === 200, [kc1.status, kc2.status]);
+      r = await req(base, tC, 'POST', `/api/kills/${kc2.json.kill.id}/confirm`, {});
+      st = r.json.state;
+      check('double-confirm: the first confirm pays the killer and kills the victim exactly once',
+        me(st, C).alive === false && me(st, C).stats.deaths === 1 && me(st, A).seasonKills === 2, [me(st, C).stats.deaths, me(st, A).seasonKills]);
+      check('double-confirm: the other pending claim is auto-rejected as SUPERSEDED, with a feed note',
+        st.kills.find(k => k.id === kc1.json.kill.id).status === 'rejected' &&
+        st.messages.some(m => /superseded/i.test(m.text)), st.kills.find(k => k.id === kc1.json.kill.id).status);
+      check('double-confirm: the superseded killer was paid nothing', me(st, D).xp === 0, me(st, D).xp);
+      check('double-confirm: confirming the superseded claim now 404s (no longer pending)',
+        (await req(base, tC, 'POST', `/api/kills/${kc1.json.kill.id}/confirm`, {})).status === 404);
+
+      // double-confirm, path 2: the second claim is DISPUTED before the
+      // first confirms, so it survives the supersede sweep — the admin
+      // settle path must refuse to confirm it against a dead victim.
+      const kf1 = await req(base, tD, 'POST', '/api/kills', { victimId: F, stealth: false });
+      const kf2 = await req(base, tV, 'POST', '/api/kills', { victimId: F, stealth: false });
+      await req(base, tF, 'POST', `/api/kills/${kf1.json.kill.id}/dispute`, {});
+      r = await req(base, tF, 'POST', `/api/kills/${kf2.json.kill.id}/confirm`, {});
+      st = r.json.state;
+      check('settle-guard setup: the vice\'s confirm stands, founder dead once',
+        me(st, F).alive === false && me(st, F).stats.deaths === 1, [me(st, F).alive, me(st, F).stats.deaths]);
+      r = await req(base, tV, 'POST', '/api/admin/settle-kill', { killId: kf1.json.kill.id, outcome: 'confirm' });
+      check('double-confirm: settle-confirm against an eliminated victim → 400 explaining why',
+        r.status === 400 && /already eliminated/i.test(r.json.error || ''), [r.status, r.json.error]);
+      st = (await req(base, tV, 'GET', '/api/state')).json;
+      check('double-confirm: the disputed claim was auto-rejected; nobody double-paid, no second death',
+        st.kills.find(k => k.id === kf1.json.kill.id).status === 'rejected' && me(st, D).xp === 0 && me(st, F).stats.deaths === 1,
+        [st.kills.find(k => k.id === kf1.json.kill.id).status, me(st, D).xp, me(st, F).stats.deaths]);
+
+      // minor admin guards
+      check('guard: Duck on a watching member → 400', (await req(base, tF, 'POST', '/api/admin/duck', { playerId: WATCH })).status === 400);
+      check('guard: event-win on a watching member → 400', (await req(base, tF, 'POST', '/api/admin/event-win', { playerId: WATCH })).status === 400);
+      check('guard: adjust-xp on a watching member → 400', (await req(base, tF, 'POST', '/api/admin/adjust-xp', { playerId: WATCH, delta: 50, note: 'x' })).status === 400);
+      check('guard: adjust-xp with a fractional delta → 400', (await req(base, tF, 'POST', '/api/admin/adjust-xp', { playerId: A, delta: 10.5, note: 'x' })).status === 400);
+      st = (await req(base, tF, 'GET', '/api/state')).json;
+      const xpBefore = me(st, A).xp;
+      r = await req(base, tF, 'POST', '/api/admin/adjust-xp', { playerId: A, delta: 25, note: 'integer still fine' });
+      check('guard: a whole-number adjust still lands exactly', r.status === 200 && me(r.json.state, A).xp === xpBefore + 25, [r.status, me(r.json.state, A).xp, xpBefore]);
+      check('guard: bounty on an UNCLAIMED hunter → 400', (await req(base, tF, 'POST', '/api/admin/bounty', { targetId: LOGAN, amount: 100 })).status === 400);
+      check('guard: bounty on a DEAD hunter → 400', (await req(base, tF, 'POST', '/api/admin/bounty', { targetId: B, amount: 100 })).status === 400);
+      check('guard: kill claim on an UNCLAIMED victim → 400', (await req(base, tA, 'POST', '/api/kills', { victimId: LOGAN })).status === 400);
+
+      // coordinate validation (raw bodies: JSON.stringify cannot emit 1e999)
+      await req(base, tA, 'POST', '/api/sharing', { on: true });
+      r = await rawReq(base, tA, 'POST', '/api/position', '{"lat":1e999,"lng":-83.0}');
+      check('coords: position with lat 1e999 (Infinity) → 400', r.status === 400, r.status);
+      check('coords: position with lat 91 → 400', (await req(base, tA, 'POST', '/api/position', { lat: 91, lng: -83 })).status === 400);
+      check('coords: position with lng −181 → 400', (await req(base, tA, 'POST', '/api/position', { lat: 40, lng: -181 })).status === 400);
+      check('coords: a valid fix still posts → 200', (await req(base, tA, 'POST', '/api/position', { lat: 40.0, lng: -83.0 })).status === 200);
+      r = await rawReq(base, tA, 'POST', '/api/safe-zones', '{"label":"work","lat":40.0,"lng":-83.0,"radius":1e999}');
+      check('coords: safe-zone with radius 1e999 → 400', r.status === 400, r.status);
+      check('coords: safe-zone with a 5 m radius → 400', (await req(base, tA, 'POST', '/api/safe-zones', { label: 'work', lat: 40, lng: -83, radius: 5 })).status === 400);
+      check('coords: safe-zone with lat −91 → 400', (await req(base, tA, 'POST', '/api/safe-zones', { label: 'work', lat: -91, lng: -83, radius: 150 })).status === 400);
+      check('coords: a sane safe-zone still saves → 200', (await req(base, tA, 'POST', '/api/safe-zones', { label: 'work', lat: 40, lng: -83, radius: 150 })).status === 200);
+
+      // app assets are no-cache; media is not forced
+      for (const pth of ['/app.js', '/', '/style.css', '/sw.js']) {
+        const resp = await fetch(base + pth);
+        check(`cache: ${pth} is served no-cache`, (resp.headers.get('cache-control') || '').includes('no-cache'), resp.headers.get('cache-control'));
+      }
+
+      // close-season rider on a real close: start 2000 → next start 2001
+      st = (await req(base, tF, 'POST', '/api/admin/close-season', { lastManId: A })).json.state;
+      check('close rider: the next season starts on the Jan 1 after the CLOSED season\'s own start',
+        st.league.season === 2 && st.league.seasonStart === '2001-01-01T05:00:00.000Z', [st.league.season, st.league.seasonStart]);
+    } finally { child.kill(); }
+  }
+
+  // ── Part B: setup season — close refused; restore identity; normalize ──
+  {
+    const { child, base } = await startServer(3431, '2027-01-01T05:00:00.000Z');
+    try {
+      const tF = await claim(base, F), tA = await claim(base, A);
+      let r = await req(base, tF, 'POST', '/api/admin/close-season', { lastManId: A });
+      let st = (await req(base, tF, 'GET', '/api/state')).json;
+      check('close guard: closing during SETUP → 400, no phantom archive, no phantom pay, season unmoved',
+        r.status === 400 && st.archive.length === 0 && st.league.season === 1 && me(st, A).xp === 0,
+        [r.status, st.archive.length, st.league.season, me(st, A).xp]);
+
+      await req(base, tA, 'POST', '/api/messages', { text: 'roster marker' });
+      const dl = await rawReq(base, tF, 'GET', '/api/admin/backup');
+      const good = JSON.parse(dl.text);
+      const restore = obj => rawReq(base, tF, 'POST', '/api/admin/restore', JSON.stringify(obj));
+
+      const foreign = JSON.parse(dl.text);
+      for (const p of foreign.state.players) p.id = p.id + '-x';
+      r = await restore(foreign);
+      check('restore identity: a backup with a FOREIGN roster → 400 naming the roster problem',
+        r.status === 400 && /different roster/i.test(r.text), [r.status, r.text.slice(0, 120)]);
+      st = (await req(base, tF, 'GET', '/api/state')).json;
+      check('restore identity: the league is untouched after the foreign restore',
+        st.players[0].id === F && st.messages.some(m => m.text === 'roster marker'));
+
+      const subset = JSON.parse(dl.text);
+      subset.state.players.pop();
+      r = await restore(subset);
+      check('restore identity: a backup MISSING one roster member → 400', r.status === 400, r.status);
+
+      const noFounder = JSON.parse(dl.text);
+      noFounder.state.players.find(p => p.id === F).role = 'Member';
+      r = await restore(noFounder);
+      check('restore identity: a backup with NO Founder → 400', r.status === 400 && /no Founder/i.test(r.text), [r.status, r.text.slice(0, 120)]);
+
+      r = await restore(good);
+      check('restore identity: the league\'s own backup still restores → 200', r.status === 200, r.status);
+
+      const mangled = JSON.parse(dl.text);
+      const pa = mangled.state.players.find(p => p.id === A);
+      delete pa.xp; pa.seasonKills = 'abc';
+      r = await restore(mangled);
+      st = (await req(base, tF, 'GET', '/api/state')).json;
+      check('normalize: a restore with xp deleted and seasonKills as a string lands as 0 / 0, never NaN',
+        r.status === 200 && me(st, A).xp === 0 && me(st, A).seasonKills === 0, [r.status, me(st, A).xp, me(st, A).seasonKills]);
+    } finally { child.kill(); }
+  }
+
+  // ── Part C: PIN throttle + scrypt + legacy upgrade ──
+  {
+    const { child, base, dataDir } = await startServer(3432, '2000-01-01T05:00:00.000Z');
+    try {
+      const tF = await claim(base, F);
+      await claim(base, A); await claim(base, B); await claim(base, C);
+      const disk = () => JSON.parse(fs.readFileSync(path.join(dataDir, 'data.json'), 'utf8'));
+      const hashOf = id => disk().players.find(p => p.id === id).pinHash;
+      check('pin: new claims store a self-describing scrypt hash', /^scrypt:[0-9a-f]{32}:[0-9a-f]{128}$/.test(hashOf(A)), hashOf(A));
+
+      const login = (id, pin) => req(base, null, 'POST', '/api/login', { playerId: id, pin });
+      let statuses = [];
+      for (let i = 0; i < 7; i++) statuses.push((await login(A, '9999')).status);
+      check('throttle: the first 7 wrong PINs are plain 403s', statuses.every(s => s === 403), statuses);
+      let r = await login(A, '9999');
+      check('throttle: the 8th wrong PIN inside 10 minutes locks the login → 429', r.status === 429 && /locked/i.test(r.json.error || ''), [r.status, r.json.error]);
+      r = await login(A, '1234');
+      check('throttle: even the CORRECT PIN is refused while locked → 429', r.status === 429, r.status);
+
+      statuses = [];
+      for (let i = 0; i < 3; i++) statuses.push((await login(B, '9999')).status);
+      r = await login(B, '1234');
+      check('throttle: a few failures then the right PIN still logs in', statuses.every(s => s === 403) && r.status === 200, [statuses, r.status]);
+      statuses = [];
+      for (let i = 0; i < 7; i++) statuses.push((await login(B, '9999')).status);
+      check('throttle: success RESET the counter — 7 fresh failures are still just 403s', statuses.every(s => s === 403), statuses);
+      r = await login(B, '9999');
+      check('throttle: …and the 8th fresh failure locks again → 429', r.status === 429, r.status);
+
+      // legacy SHA-256 hash (an old backup's record) still verifies…
+      const dl = await rawReq(base, tF, 'GET', '/api/admin/backup');
+      const bk = JSON.parse(dl.text);
+      bk.state.players.find(p => p.id === C).pinHash = crypto.createHash('sha256').update('1234::' + C).digest('hex');
+      r = await rawReq(base, tF, 'POST', '/api/admin/restore', JSON.stringify(bk));
+      check('legacy: restoring a backup with a legacy-hash PIN record → 200', r.status === 200, r.status);
+      check('legacy: a WRONG PIN against the legacy hash → 403', (await login(C, '9999')).status === 403);
+      r = await login(C, '1234');
+      check('legacy: the correct PIN against the legacy hash logs in → 200', r.status === 200, r.status);
+      check('legacy: the stored hash was upgraded to scrypt on that login', /^scrypt:/.test(hashOf(C)), hashOf(C));
+    } finally { child.kill(); }
+  }
+
+  // ── Part D: push endpoint SSRF guard (hatch OFF) + hatch proof ──
+  {
+    const { child, base } = await startServer(3433, '2027-01-01T05:00:00.000Z', { PUSH_ALLOW_INSECURE_ENDPOINTS: '0' });
+    try {
+      const tA = await claim(base, A);
+      const sub = endpoint => req(base, tA, 'POST', '/api/push/subscribe', { subscription: { endpoint, keys: { p256dh: 'BP' + 'A'.repeat(84), auth: 'AAAAAAAAAAAAAAAAAAAAAA' } } });
+      check('ssrf: Apple push endpoint accepted', (await sub('https://web.push.apple.com/abc')).status === 200);
+      check('ssrf: FCM endpoint accepted', (await sub('https://fcm.googleapis.com/fcm/send/abc')).status === 200);
+      check('ssrf: Mozilla push endpoint accepted', (await sub('https://push.services.mozilla.com/wpush/v2/abc')).status === 200);
+      check('ssrf: WNS subdomain endpoint accepted', (await sub('https://db5p.notify.windows.com/w/?token=1')).status === 200);
+      check('ssrf: http loopback endpoint → 400', (await sub('http://127.0.0.1:9/dead')).status === 400);
+      check('ssrf: https loopback literal → 400', (await sub('https://127.0.0.1/dead')).status === 400);
+      check('ssrf: https private 192.168 literal → 400', (await sub('https://192.168.1.50/x')).status === 400);
+      check('ssrf: https private 10.x literal → 400', (await sub('https://10.0.0.9/x')).status === 400);
+      check('ssrf: https IPv6 loopback literal → 400', (await sub('https://[::1]/x')).status === 400);
+      check('ssrf: an unknown https host → 400', (await sub('https://evil.example.com/push')).status === 400);
+      check('ssrf: a suffix-spoof host (…apple.com.evil.com) → 400', (await sub('https://web.push.apple.com.evil.com/x')).status === 400);
+    } finally { child.kill(); }
+    const h = await startServer(3434, '2027-01-01T05:00:00.000Z');
+    try {
+      const tA = await claim(h.base, A);
+      const r = await req(h.base, tA, 'POST', '/api/push/subscribe', { subscription: { endpoint: 'http://127.0.0.1:9/dead', keys: { p256dh: 'BP' + 'A'.repeat(84), auth: 'AAAAAAAAAAAAAAAAAAAAAA' } } });
+      check('ssrf: with the test-only hatch ON, a localhost endpoint subscribes (what the push suites rely on)', r.status === 200, r.status);
+    } finally { h.child.kill(); }
+  }
+
+  // ── Part E: corrupt store quarantine + last-good .bak (subprocess) ──
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'os-store-'));
+    const script = `
+      const fs = require('fs'), path = require('path');
+      const dir = process.env.DATA_DIR;
+      const file = path.join(dir, 'data.json');
+      const store = require(${JSON.stringify(path.join(APP_DIR, 'lib', 'store.js'))});
+      const out = {};
+      const corruptCount = () => fs.readdirSync(dir).filter(f => f.includes('.corrupt-')).length;
+      let d = store.load();
+      out.missingSeeds = d.players.length === 16 && corruptCount() === 0;
+      fs.writeFileSync(file, 'this is not json {{{');
+      d = store.load();
+      out.garbageSeeds = d.players.length === 16 && d.league.season === 1;
+      out.garbageQuarantined = corruptCount() === 1;
+      out.afterGarbageParses = !!JSON.parse(fs.readFileSync(file, 'utf8')).league;
+      fs.writeFileSync(file, '{"hello":1}');
+      d = store.load();
+      out.shapeSeeds = d.players.length === 16;
+      out.shapeQuarantined = corruptCount() === 2;
+      const bakFile = file + '.bak';
+      d.league.pot = 42; store.save(d);
+      out.bakExists = fs.existsSync(bakFile);
+      out.bakHoldsPrevious = JSON.parse(fs.readFileSync(bakFile, 'utf8')).league.pot === 0;
+      d.league.pot = 77; store.save(d);
+      out.bakThrottled = JSON.parse(fs.readFileSync(bakFile, 'utf8')).league.pot === 0 && JSON.parse(fs.readFileSync(file, 'utf8')).league.pot === 77;
+      const old = new Date(Date.now() - 10 * 60000);
+      fs.utimesSync(bakFile, old, old);
+      d.league.pot = 99; store.save(d);
+      out.bakRefreshesWhenAged = JSON.parse(fs.readFileSync(bakFile, 'utf8')).league.pot === 77;
+      console.log(JSON.stringify(out));
+    `;
+    let info = null;
+    try { info = JSON.parse(execFileSync('node', ['-e', script], { env: { ...process.env, DATA_DIR: dir }, encoding: 'utf8' }).trim().split('\n').pop()); } catch (e) { /* asserted below */ }
+    check('store: the probe script ran', !!info, info);
+    if (info) {
+      check('store: a missing file seeds fresh with nothing quarantined', info.missingSeeds === true, info);
+      check('store: a garbage file is QUARANTINED (not overwritten) and the league reseeds', info.garbageSeeds === true && info.garbageQuarantined === true && info.afterGarbageParses === true, info);
+      check('store: a wrong-shape file is quarantined the same way', info.shapeSeeds === true && info.shapeQuarantined === true, info);
+      check('store: saves plant a last-good .bak holding the PREVIOUS good file', info.bakExists === true && info.bakHoldsPrevious === true, info);
+      check('store: the .bak refresh is throttled (a hot save leaves it alone)', info.bakThrottled === true, info);
+      check('store: an aged .bak is refreshed from the then-current good file on the next save', info.bakRefreshesWhenAged === true, info);
+    }
+  }
+
+  // ── Part F: the load/render safety net — live-season scrimmage flag ──
+  {
+    const dirF = fs.mkdtempSync(path.join(os.tmpdir(), 'os-net-'));
+    async function bootOnDir(port, startIso) {
+      const child = spawn('node', ['server.js'], {
+        cwd: APP_DIR,
+        env: { ...process.env, PORT: String(port), DATA_DIR: dirF, SEASON_START_ISO: startIso, PUSH_ALLOW_INSECURE_ENDPOINTS: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.stderr.on('data', d => process.stderr.write(`[server ${port}] ${d}`));
+      const base = `http://127.0.0.1:${port}`;
+      for (let i = 0; i < 60; i++) {
+        try { const r = await fetch(base + '/api/roster'); if (r.ok) return { child, base }; } catch (_) { }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      child.kill();
+      throw new Error('server did not start on ' + port);
+    }
+    const b1 = await bootOnDir(3435, '2027-01-01T05:00:00.000Z');
+    let tF;
+    try {
+      tF = await claim(b1.base, F);
+      const tA = await claim(b1.base, A), tB = await claim(b1.base, B);
+      await req(b1.base, tF, 'POST', '/api/admin/scrimmage', { on: true });
+      const k = await req(b1.base, tA, 'POST', '/api/kills', { victimId: B, stealth: false });
+      const st = (await req(b1.base, tB, 'POST', `/api/kills/${k.json.kill.id}/confirm`, {})).json.state;
+      check('net setup: a practice kill is on the board (victim down, practice counter 1)',
+        st.kills.length === 1 && me(st, B).alive === false && me(st, A).scrimmageKills === 1, [st.kills.length, me(st, A).scrimmageKills]);
+    } finally { b1.child.kill(); }
+    // The flag survives into the live season (old save / hand edit / restore).
+    const fileF = path.join(dirF, 'data.json');
+    const doctored = JSON.parse(fs.readFileSync(fileF, 'utf8'));
+    doctored.league.seasonStart = '2000-01-01T05:00:00.000Z'; // season now live, scrimmage still true
+    fs.writeFileSync(fileF, JSON.stringify(doctored, null, 1));
+    const autoEnds = st => st.messages.filter(m => /SCRIMMAGE AUTO-ENDED/.test(m.text)).length;
+    const b2 = await bootOnDir(3436, '2000-01-01T05:00:00.000Z');
+    try {
+      const st = (await req(b2.base, tF, 'GET', '/api/state')).json;
+      check('net: at load the live-season scrimmage is auto-ended — practice board reset, everyone back up',
+        st.league.phase === 'live' && st.league.scrimmage === false && st.kills.length === 0 && me(st, B).alive === true && autoEnds(st) === 1,
+        [st.league.phase, st.league.scrimmage, st.kills.length, autoEnds(st)]);
+    } finally { b2.child.kill(); }
+    const b3 = await bootOnDir(3437, '2000-01-01T05:00:00.000Z');
+    try {
+      const st = (await req(b3.base, tF, 'GET', '/api/state')).json;
+      check('net: exactly once — a second boot does not re-fire it', autoEnds(st) === 1 && st.league.scrimmage === false, autoEnds(st));
+    } finally { b3.child.kill(); }
+  }
+
+  // ── Part H: Deadliest Man stays unawarded at zero kills ──
+  {
+    const { child, base } = await startServer(3439, '2000-01-01T05:00:00.000Z');
+    try {
+      const tF = await claim(base, F);
+      await claim(base, A);
+      const st = (await req(base, tF, 'POST', '/api/admin/close-season', { lastManId: A })).json.state;
+      check('deadliest: a zero-kill season archives NO Deadliest Man (null, not roster order)',
+        st.archive.length === 1 && st.archive[0].deadliestId === null && st.archive[0].deadliestName === null && st.archive[0].deadliestKills === 0, st.archive[0]);
+      check('deadliest: no deadliest-man ledger entry was paid; the Last Man pay stands',
+        ledger(st, A, 'deadliest-man').length === 0 && ledger(st, A, 'last-man').length === 1 && ledger(st, A, 'last-man')[0].delta === 500,
+        [ledger(st, A, 'deadliest-man').length, ledger(st, A, 'last-man').length]);
+    } finally { child.kill(); }
+  }
+
+  // ── Part I: client statics — dead-session handling, victim select, feed ──
+  {
+    const src = fs.readFileSync(path.join(APP_DIR, 'public', 'app.js'), 'utf8');
+    check('client: handleDeadSession exists with the loop guard + token clear',
+      src.includes('function handleDeadSession(') &&
+      src.slice(src.indexOf('// BEGIN dead-session handling'), src.indexOf('// END dead-session handling')).includes("localStorage.removeItem('os_token')") &&
+      src.includes('os_dead_session_at') && src.includes('location.reload()'));
+    const apiBody = src.slice(src.indexOf('async function api('), src.indexOf('function nameOf('));
+    check('client: api() routes 401s (with a token in hand) into the dead-session path',
+      apiBody.includes('r.status === 401') && apiBody.includes('handleDeadSession()'), apiBody.slice(0, 120));
+    const chatBody = src.slice(src.indexOf('function renderChat()'), src.indexOf('async function reactTo('));
+    check('client: renderChat preserves the chosen kill victim across rebuilds',
+      chatBody.includes('prevVictim') && chatBody.includes('victimSel.value = prevVictim'), chatBody.length);
+    check('client: the feed only autoscrolls when the hunter was already near the bottom',
+      chatBody.includes('nearBottom') && chatBody.includes('if (nearBottom) fid.scrollTop = fid.scrollHeight'), chatBody.length);
+  }
+}
+
 (async () => {
   try {
     await suiteSetup();
@@ -1435,6 +1943,8 @@ async function suitePushHotfix() {
     await suiteHuntMode();
     await suiteRound7();
     await suitePushHotfix();
+    await suiteFieldPreservation();
+    await suiteHardening();
   } catch (e) { failed++; console.error('\nSUITE ERROR:', e); }
   console.log(`\n════ RESULT: ${passed} passed, ${failed} failed ════`);
   process.exit(failed ? 1 : 0);

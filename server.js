@@ -114,10 +114,53 @@ const HUNT_BLAST_COOLDOWN_MS = Number(process.env.HUNT_BLAST_COOLDOWN_MS) || 30 
 // timestamps (sleep-resilient). Both env-overridable for the test suite.
 const PING_COOLDOWN_MS = Number(process.env.PING_COOLDOWN_MS) || 60 * 60 * 1000;
 const CHECK_TICK_MS = Number(process.env.CHECK_TICK_MS) || 30 * 1000;
+// PIN login throttle (Round 10): after LOGIN_MAX_FAILS wrong PINs inside
+// the window, that player's login locks for LOGIN_LOCK_MS. Counters live
+// on the player record, so they persist across restarts like everything
+// else in the store.
+const LOGIN_MAX_FAILS = 8;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_LOCK_MS = 10 * 60 * 1000;
+// Push endpoint allowlist (Round 10): a stored subscription endpoint is a
+// URL this server POSTs to with a signed VAPID Authorization header, so
+// it must be a real push service — https only, never a private/loopback
+// address literal, host on (or under) one of these vendor domains.
+// PUSH_ALLOW_INSECURE_ENDPOINTS=1 disables the check; the TEST SUITE
+// sets it to talk to its localhost fake push service — production never
+// should.
+const PUSH_HOST_SUFFIXES = ['push.apple.com', 'fcm.googleapis.com', 'push.services.mozilla.com', 'notify.windows.com'];
 const REACTION_EMOJIS = ['🔥', '🦆', '🏆', '😂'];
 
 let state = store.load();
 const save = () => store.save(state);
+
+// ── Round 10 safety net ──────────────────────────────────────────────────────
+// Ending a scrimmage wipes state.kills and resurrects the whole board
+// (resetPracticeBoard, below — it IS the practice reset). That makes a
+// scrimmage flag sitting on a LIVE season a loaded gun: one admin toggle
+// would erase real confirmed kills while their XP stayed on the books.
+// The scrimmage route now refuses to START outside setup; this net is
+// the second line of defense for a flag that arrives any other way (an
+// old save, a hand-edited store, a doctored restore): if the league is
+// loaded — or rendered — with scrimmage on while the season is live, the
+// scrimmage is auto-ended with the normal practice-board reset, exactly
+// once, before any live kill can exist under it. The flag flipping off
+// is what makes it exactly-once: every later pass sees scrimmage false.
+function resetPracticeBoard() {
+  state.league.checkCall = null; // a running Location Check dies quietly with the scrimmage — no eliminations
+  state.kills = [];
+  state.dangerPairs = {};
+  state.players.forEach(p => { p.alive = true; p.out = false; p.scrimmageKills = 0; p.killCancelCard = true; p.immuneUntil = null; p.diedAt = null; p.sharing = false; p.position = null; p.zoneStatus = null; p.driving = false; p.drvFast = 0; p.drvSlow = 0; p.lastFix = null; p.hunting = false; p.huntStartedAt = null; });
+}
+function autoEndLiveScrimmage() {
+  if (!state.league.scrimmage || phase() !== 'live') return;
+  state.league.scrimmage = false;
+  resetPracticeBoard();
+  feed('system', '🏋 SCRIMMAGE AUTO-ENDED — a practice flag was found on a live season and was cleared with a practice-board reset before it could touch the real board. Career XP untouched.', null);
+  save();
+  console.warn('Open Season: auto-ended a scrimmage flag found on a live season.');
+}
+autoEndLiveScrimmage();
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function phase() {
@@ -127,6 +170,30 @@ function phase() {
 function playerById(id) { return state.players.find(p => p.id === id) || null; }
 function nameOf(id) { const p = playerById(id); return p ? p.name : 'Unknown'; }
 function hashPin(pin, id) { return crypto.createHash('sha256').update(String(pin) + '::' + id).digest('hex'); }
+// PIN storage (Round 10): NEW hashes are scrypt with a per-player random
+// salt, stored self-describing as `scrypt:<saltHex>:<hashHex>` so the
+// verifier can tell formats apart forever. LEGACY hashes (a bare SHA-256
+// hex of `pin::playerId`, salt = the public roster id) still verify —
+// old backups restore them and those logins must keep working — and a
+// successful legacy login upgrades the stored hash on the spot.
+function newPinHash(pin) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(String(pin), salt, 64);
+  return `scrypt:${salt.toString('hex')}:${hash.toString('hex')}`;
+}
+function verifyPin(pin, p) {
+  if (!p || !p.pinHash) return false;
+  if (String(p.pinHash).startsWith('scrypt:')) {
+    const parts = String(p.pinHash).split(':');
+    if (parts.length !== 3) return false;
+    try {
+      const expected = Buffer.from(parts[2], 'hex');
+      const actual = crypto.scryptSync(String(pin), Buffer.from(parts[1], 'hex'), expected.length);
+      return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+    } catch (_) { return false; }
+  }
+  return p.pinHash === hashPin(pin, p.id); // legacy SHA-256 (pre-Round-10 saves and backups)
+}
 function newToken() { return crypto.randomBytes(24).toString('hex'); }
 function haversineM(aLat, aLng, bLat, bLng) {
   const R = 6371000, rad = d => d * Math.PI / 180;
@@ -333,6 +400,37 @@ function feed(kind, text, playerId, opts = {}) {
     killId: opts.killId || null, onlyFor: opts.onlyFor || null, reactions: {},
   });
 }
+// Is this host an IP literal in a private / loopback / link-local range?
+// Covers dotted-quad IPv4, IPv4-mapped IPv6, and the IPv6 loopback /
+// link-local (fe80::/10) / unique-local (fc00::/7) prefixes. A hostname
+// (not a literal) returns false — the allowlist below is what gates those.
+function isPrivateHostLiteral(host) {
+  let h = String(host || '').toLowerCase();
+  if (h.startsWith('::ffff:')) h = h.slice(7); // IPv4-mapped IPv6 → check the v4 tail
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) {
+    const [a, b] = h.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168);
+  }
+  if (h.includes(':')) return h === '::1' || h === '::' || /^fe[89ab]/.test(h) || /^f[cd]/.test(h);
+  return false;
+}
+// May the server store (and later POST to, with a signed VAPID header)
+// this subscription endpoint? Only real push services: https, not a
+// private address literal, host equal to or under a known vendor domain
+// (Apple / Google FCM / Mozilla / Microsoft WNS). Anything else is an
+// SSRF-shaped hole, so it is refused at subscribe time.
+function pushEndpointAllowed(endpoint) {
+  if (process.env.PUSH_ALLOW_INSECURE_ENDPOINTS === '1') return true; // test-suite escape hatch only
+  let u;
+  try { u = new URL(endpoint); } catch (_) { return false; }
+  if (u.protocol !== 'https:') return false;
+  const host = u.hostname.toLowerCase();
+  if (!host || isPrivateHostLiteral(host)) return false;
+  return PUSH_HOST_SUFFIXES.some(d => host === d || host.endsWith('.' + d));
+}
 // Best-effort Web Push — never awaited by routes, never blocks a request.
 function notify(player, title, body, tag) {
   if (!player) return;
@@ -460,6 +558,7 @@ function backupStaleFor(viewer) {
   return !last || Date.now() - last > BACKUP_STALE_MS;
 }
 function snapshot(viewer) {
+  autoEndLiveScrimmage(); // Round 10 net, render half: a restore can land a live-season scrimmage flag between boots
   const leagueOut = { ...state.league, phase: phase(), cancelWindowHours: 24 };
   delete leagueOut.lastBackupAt; // admin bookkeeping — rides only in the admin `backup` block below
   delete leagueOut.checkCall; // the active Location Check rides as the curated public block below
@@ -562,7 +661,12 @@ function buildBackup() {
 }
 // Returns an error string, or null when the backup is restorable. Pure check:
 // a failed validation must leave the running league untouched.
-function validateBackup(b) {
+// `currentPlayers` (Round 10): the roster-identity check — a backup whose
+// player ids are not EXACTLY this league's roster (or that carries no
+// Founder) would restore into a league nobody can log into or administer:
+// the claims and PINs belong to people who are not on it, and the men who
+// ARE on it have no records. Refused outright.
+function validateBackup(b, currentPlayers) {
   if (!b || typeof b !== 'object' || Array.isArray(b)) return 'That file is not an Open Season backup (expected a JSON object)';
   if (b.format !== BACKUP_FORMAT) return 'That file is not an Open Season backup (missing format marker)';
   if (b.version !== BACKUP_VERSION) return `Unsupported backup version (${b.version}) — this app restores version ${BACKUP_VERSION}`;
@@ -577,6 +681,16 @@ function validateBackup(b) {
   if (b.vapid !== undefined && b.vapid !== null) {
     if (typeof b.vapid !== 'object' || typeof b.vapid.publicKey !== 'string' || typeof b.vapid.privateKey !== 'string') {
       return 'Backup push-key (VAPID) block is malformed';
+    }
+  }
+  if (currentPlayers) {
+    const want = new Set(currentPlayers.map(p => p.id));
+    const got = s.players.map(p => p.id);
+    if (got.length !== want.size || got.some(id => !want.has(id))) {
+      return 'That backup belongs to a different roster — restoring it would lock everyone out. Nothing was changed.';
+    }
+    if (!s.players.some(p => p.role === 'Founder')) {
+      return 'That backup has no Founder on its roster — restoring it would leave the league with no admin. Nothing was changed.';
     }
   }
   return null;
@@ -624,6 +738,31 @@ function resolveKill(k, via) {
 function otherStandingKill(victimId, exceptKillId) {
   return state.kills.find(x => x.id !== exceptKillId && x.victimId === victimId && (x.status === 'confirmed' || x.status === 'overridden')) || null;
 }
+// ── Round 10: a kill confirms exactly once ───────────────────────────────────
+// Two different killers can both hold claims on one victim (the claim
+// route only blocks a duplicate from the SAME killer). Before this fix,
+// both could confirm: both killers paid, the victim charged twice, two
+// deaths on his record. confirmKill() is the single gate both confirm
+// paths (victim confirm, admin settle) go through:
+//  - if the victim is already out/dead, or ANOTHER kill already stands
+//    on him, this claim is auto-rejected and the caller gets an error;
+//  - on a successful confirm, every OTHER pending claim on the victim is
+//    auto-rejected as superseded, so it can never be confirmed later.
+function confirmKill(k, via) {
+  const victim = playerById(k.victimId);
+  if (!victim || !victim.alive || victim.out || otherStandingKill(k.victimId, k.id)) {
+    k.status = 'rejected';
+    feed('system', `A kill claim on ${victim ? victim.name : 'a hunter'} was auto-rejected — superseded: the victim is already eliminated.`, null);
+    return 'That claim was auto-rejected — the victim is already eliminated by another kill';
+  }
+  resolveKill(k, via);
+  const superseded = state.kills.filter(x => x.id !== k.id && x.victimId === k.victimId && x.status === 'pending');
+  if (superseded.length) {
+    for (const x of superseded) x.status = 'rejected';
+    feed('system', `${superseded.length} other pending claim${superseded.length === 1 ? '' : 's'} on ${victim.name} auto-rejected — superseded: victim already eliminated.`, null);
+  }
+  return null;
+}
 
 // ── API ──────────────────────────────────────────────────────────────────────
 async function api(req, res, url) {
@@ -655,7 +794,7 @@ async function api(req, res, url) {
     if (p.claimed) return json(res, 409, { error: 'That spot is already claimed — log in with your PIN instead' });
     if (!body.pin || String(body.pin).length < 4) return json(res, 400, { error: 'PIN must be at least 4 characters' });
     p.claimed = true;
-    p.pinHash = hashPin(body.pin, p.id);
+    p.pinHash = newPinHash(body.pin);
     p.token = newToken();
     p.joinedAt = new Date().toISOString();
     feed('system', `${p.name} joined the league.`, p.id);
@@ -666,7 +805,33 @@ async function api(req, res, url) {
   if (method === 'POST' && url.pathname === '/api/login') {
     const p = playerById(body.playerId);
     if (!p || !p.claimed) return json(res, 404, { error: 'Spot not claimed yet' });
-    if (p.pinHash !== hashPin(body.pin || '', p.id)) return json(res, 403, { error: 'Wrong PIN' });
+    // Round 10 throttle: a locked player stays locked (even for the
+    // right PIN) until the lock runs out; failures inside the window
+    // count toward the next lock; a success wipes the slate.
+    const now = Date.now();
+    if (!Array.isArray(p.loginFailTs)) p.loginFailTs = [];
+    p.loginFailTs = p.loginFailTs.filter(t => now - t < LOGIN_WINDOW_MS);
+    if (p.loginLockUntil && p.loginLockUntil > now) {
+      const mins = Math.max(1, Math.ceil((p.loginLockUntil - now) / 60000));
+      return json(res, 429, { error: `Too many wrong PIN attempts — login for ${p.name} is locked for about ${mins} more minute${mins === 1 ? '' : 's'}` });
+    }
+    if (!verifyPin(body.pin || '', p)) {
+      p.loginFailTs.push(now);
+      if (p.loginFailTs.length >= LOGIN_MAX_FAILS) {
+        p.loginLockUntil = now + LOGIN_LOCK_MS;
+        p.loginFailTs = [];
+        save();
+        return json(res, 429, { error: `Too many wrong PIN attempts — login for ${p.name} is locked for ${LOGIN_LOCK_MS / 60000} minutes` });
+      }
+      save();
+      return json(res, 403, { error: 'Wrong PIN' });
+    }
+    p.loginFailTs = [];
+    p.loginLockUntil = 0;
+    // Upgrade-on-login: a legacy SHA-256 hash that just verified is
+    // replaced with a scrypt hash, so old saves/backups migrate forward
+    // one successful login at a time.
+    if (!String(p.pinHash).startsWith('scrypt:')) p.pinHash = newPinHash(body.pin || '');
     p.token = newToken();
     save();
     return json(res, 200, { token: p.token, state: snapshot(p) });
@@ -688,6 +853,9 @@ async function api(req, res, url) {
     const sub = body.subscription;
     if (!sub || typeof sub.endpoint !== 'string' || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
       return json(res, 400, { error: 'A full push subscription (endpoint + keys) is required' });
+    }
+    if (!pushEndpointAllowed(sub.endpoint)) {
+      return json(res, 400, { error: 'That push endpoint is not a recognized push service — subscription refused' });
     }
     me.pushSubs = me.pushSubs.filter(s => s.endpoint !== sub.endpoint);
     me.pushSubs.push({ endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } });
@@ -860,7 +1028,13 @@ async function api(req, res, url) {
 
   if (method === 'POST' && url.pathname === '/api/position') {
     const { lat, lng } = body;
-    if (typeof lat !== 'number' || typeof lng !== 'number') return json(res, 400, { error: 'lat/lng required' });
+    // Round 10: finite + in range. Raw JSON can carry 1e999, which parses
+    // to Infinity — a "number" that would serialize back out as null to
+    // every client and poison the speed math with NaN.
+    if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)
+      || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return json(res, 400, { error: 'lat/lng must be finite numbers in range (lat −90..90, lng −180..180)' });
+    }
     if (!me.sharing) return json(res, 400, { error: 'Turn location sharing on first' });
     const now = Date.now();
     const speed = fixSpeed(me, body, lat, lng, now); // device speed, else derived from the previous fix
@@ -877,9 +1051,22 @@ async function api(req, res, url) {
   if (method === 'POST' && url.pathname === '/api/safe-zones') {
     const { label, lat, lng } = body;
     if (!['home', 'work', 'church'].includes(label)) return json(res, 400, { error: 'label must be home, work, or church' });
-    if (typeof lat !== 'number' || typeof lng !== 'number') return json(res, 400, { error: 'lat/lng required' });
+    // Round 10: same finite/range discipline as /api/position, and the
+    // radius must be a sane number when one is sent (a non-finite radius
+    // used to be silently clamped into a real zone).
+    if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)
+      || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return json(res, 400, { error: 'lat/lng must be finite numbers in range (lat −90..90, lng −180..180)' });
+    }
+    let radius = 150;
+    if (body.radius !== undefined) {
+      radius = Number(body.radius);
+      if (!Number.isFinite(radius) || radius < 25 || radius > 2000) {
+        return json(res, 400, { error: 'Safe-zone radius must be between 25 and 2000 m' });
+      }
+    }
     me.safeZones = me.safeZones.filter(z => z.label !== label);
-    me.safeZones.push({ id: uid('zone'), label, lat, lng, radius: Math.min(1000, Math.max(50, Number(body.radius) || 150)) });
+    me.safeZones.push({ id: uid('zone'), label, lat, lng, radius });
     updateZoneStatus(me); // standing inside the zone you just saved lights the status up now
     save();
     return json(res, 200, { state: snapshot(me) });
@@ -897,6 +1084,7 @@ async function api(req, res, url) {
     const victim = playerById(body.victimId);
     if (!victim || victim.id === me.id) return json(res, 400, { error: 'Pick another hunter as your target' });
     if (me.watching || victim.watching) return json(res, 400, { error: 'Watching members are not in the hunt' });
+    if (!victim.claimed) return json(res, 400, { error: 'That hunter has not claimed their spot yet — no claims on an empty chair' });
     if (!me.alive || me.out) return json(res, 400, { error: 'You are out — dead men tell no tales' });
     if (!victim.alive || victim.out) return json(res, 400, { error: 'That hunter is already out' });
     if (isImmune(victim)) {
@@ -942,7 +1130,8 @@ async function api(req, res, url) {
     const k = state.kills.find(x => x.id === seg[2]);
     if (!k || k.status !== 'pending') return json(res, 404, { error: 'No pending claim with that id' });
     if (k.victimId !== me.id) return json(res, 403, { error: 'Only the victim can confirm' });
-    resolveKill(k, 'confirmed by victim');
+    const confirmErr = confirmKill(k, 'confirmed by victim');
+    if (confirmErr) { save(); return json(res, 400, { error: confirmErr }); }
     save();
     // Push (c): the killer hears his kill is confirmed.
     if (!scrimmage()) notify(playerById(k.killerId), 'Open Season — kill confirmed', `Your kill on ${me.name} is confirmed.`, 'kill-confirmed');
@@ -1076,7 +1265,7 @@ async function api(req, res, url) {
     }
     if (method === 'POST' && seg[2] === 'restore') {
       const b = body.__backup;
-      const err = validateBackup(b);
+      const err = validateBackup(b, state.players);
       if (err) return json(res, 400, { error: err }); // nothing has changed
       // Detach from the request object, fill defaults like a disk load.
       const next = store.normalize(JSON.parse(JSON.stringify(b.state)));
@@ -1204,7 +1393,8 @@ async function api(req, res, url) {
       if (!k || k.status !== 'disputed') return json(res, 404, { error: 'No disputed kill with that id' });
       if (k.killerId === me.id || k.victimId === me.id) return json(res, 403, { error: 'A party to the kill cannot settle it — the other admin does' });
       if (body.outcome === 'confirm') {
-        resolveKill(k, `settled by ${me.name}`);
+        const confirmErr = confirmKill(k, `settled by ${me.name}`);
+        if (confirmErr) { save(); return json(res, 400, { error: confirmErr }); }
         save();
         // Pushes (b)+(c): both parties hear the ruling — the victim died, the killer scored.
         if (!scrimmage()) {
@@ -1222,6 +1412,7 @@ async function api(req, res, url) {
     if (method === 'POST' && seg[2] === 'duck') {
       const p = playerById(body.playerId);
       if (!p) return json(res, 404, { error: 'Player not found' });
+      if (p.watching) return json(res, 400, { error: 'Watching members are not in the hunt — the Duck cannot touch them' });
       const applied = applyXp(state, p, XP.DUCK_OF_SHAME, 'duck-of-shame', `Duck of Shame awarded by ${me.name}`);
       p.seasonDucks += 1; // Duck Magnet superlative counter
       feed('duck', `🦆 DUCK OF SHAME — ${p.name} takes the duck (${applied} XP). Rubber duck on the dash until the next event, and the group expects the Creed recited out loud.`, me.id);
@@ -1233,6 +1424,8 @@ async function api(req, res, url) {
       const amount = Number(body.amount);
       if (!target) return json(res, 404, { error: 'Target not found' });
       if (target.watching) return json(res, 400, { error: 'Watching members cannot be hunted — no bounties on them' });
+      if (!target.claimed) return json(res, 400, { error: 'That hunter has not claimed their spot yet — no bounties on an empty chair' });
+      if (!target.alive || target.out) return json(res, 400, { error: 'That hunter is already out — no bounties on a dead man' });
       if (!Number.isInteger(amount) || amount < 25 || amount > 500) return json(res, 400, { error: 'Bounty must be a whole number of XP between 25 and 500' });
       const b = { id: uid('bounty'), targetId: target.id, amount, placedBy: me.id, note: String(body.note || '').slice(0, 140), createdAt: new Date().toISOString() };
       state.bounties.push(b);
@@ -1256,15 +1449,19 @@ async function api(req, res, url) {
     if (method === 'POST' && seg[2] === 'scrimmage') {
       const on = !!body.on;
       if (on === scrimmage()) return json(res, 200, { state: snapshot(me) });
+      // Round 10: a scrimmage may only START during setup. Ending one
+      // wipes state.kills and resurrects the board (the practice reset),
+      // so a start during the live season puts real confirmed kills one
+      // toggle away from vanishing while their XP stays — refused.
+      if (on && phase() !== 'setup') {
+        return json(res, 400, { error: 'Scrimmage can only start during setup — the season is live, and ending a scrimmage would wipe the real board' });
+      }
       state.league.scrimmage = on;
       if (on) {
         feed('system', `🏋 SCRIMMAGE OPEN — practice season started by ${me.name}. Kills resolve, but nothing counts: no XP, no ledger, no real outs.`, me.id);
       } else {
         // Ending a scrimmage wipes the practice board back to a clean slate.
-        state.league.checkCall = null; // a running Location Check dies quietly with the scrimmage — no eliminations
-        state.kills = [];
-        state.dangerPairs = {};
-        state.players.forEach(p => { p.alive = true; p.out = false; p.scrimmageKills = 0; p.killCancelCard = true; p.immuneUntil = null; p.diedAt = null; p.sharing = false; p.position = null; p.zoneStatus = null; p.driving = false; p.drvFast = 0; p.drvSlow = 0; p.lastFix = null; p.hunting = false; p.huntStartedAt = null; });
+        resetPracticeBoard();
         feed('system', `🏋 SCRIMMAGE OVER — ${me.name} ended practice. Board reset clean; career XP untouched.`, me.id);
       }
       save();
@@ -1273,6 +1470,7 @@ async function api(req, res, url) {
     if (method === 'POST' && seg[2] === 'event-win') {
       const p = playerById(body.playerId);
       if (!p) return json(res, 404, { error: 'Player not found' });
+      if (p.watching) return json(res, 400, { error: 'Watching members are not in the hunt — no event wins for them' });
       applyXp(state, p, XP.EVENT_WIN, 'event-win', body.note || `Combo event win recorded by ${me.name}`);
       feed('xp', `${p.name} won a combo event: +${XP.EVENT_WIN} XP.`, me.id);
       awardAchievements(p);
@@ -1282,18 +1480,28 @@ async function api(req, res, url) {
     if (method === 'POST' && seg[2] === 'adjust-xp') {
       const p = playerById(body.playerId);
       const delta = Number(body.delta);
-      if (!p || !Number.isFinite(delta) || delta === 0) return json(res, 400, { error: 'playerId and a non-zero delta are required' });
+      if (!p) return json(res, 404, { error: 'Player not found' });
+      if (p.watching) return json(res, 400, { error: 'Watching members are not in the hunt — no XP adjustments for them' });
+      if (!Number.isInteger(delta) || delta === 0) return json(res, 400, { error: 'playerId and a non-zero whole-number delta are required' });
       const applied = applyXp(state, p, delta, 'adjust', body.note || `Manual adjust by ${me.name}`);
       feed('xp', `${me.name} adjusted ${p.name}'s XP by ${applied > 0 ? '+' : ''}${applied}${body.note ? ' — ' + body.note : ''}.`, me.id);
       save();
       return json(res, 200, { state: snapshot(me) });
     }
     if (method === 'POST' && seg[2] === 'close-season') {
+      // Round 10: a season can only close while it is LIVE. In setup the
+      // same call used to pay a phantom Last Man, archive a phantom
+      // season, and advance the counter past a season nobody played.
+      if (phase() !== 'live') return json(res, 400, { error: 'The season can only be closed while it is live — there is no season to close yet' });
       const alive = state.players.filter(p => !p.watching && p.alive && !p.out);
       let lastMan = body.lastManId ? playerById(body.lastManId) : (alive.length === 1 ? alive[0] : null);
       if (!lastMan) return json(res, 400, { error: 'Name the Last Man (lastManId) — more than one hunter is still alive (Reckoning result)' });
       const hunters = state.players.filter(p => !p.watching);
-      const deadliest = [...hunters].sort((a, b) => b.seasonKills - a.seasonKills)[0];
+      // Deadliest Man requires at least one kill: at zero kills the
+      // "top" hunter is just roster order, so the title stays unawarded
+      // (null in the archive, no XP — the payment below already agreed).
+      const deadliestTop = [...hunters].sort((a, b) => b.seasonKills - a.seasonKills)[0];
+      const deadliest = deadliestTop && deadliestTop.seasonKills > 0 ? deadliestTop : null;
       // ── End-of-season superlatives (honors only — no XP attached) ──
       // First Blood: the earliest kill that still STANDS (canceled kills
       // count for nothing). Sneakiest / Duck Magnet read the net season
@@ -1352,8 +1560,20 @@ async function api(req, res, url) {
       state.players.forEach(p => awardAchievements(p));
       // Reset the season; career XP and ranks carry over untouched.
       state.league.season += 1;
-      const y = new Date().getUTCFullYear();
-      state.league.seasonStart = `${y + 1}-01-01T05:00:00.000Z`;
+      // The next season starts on the Jan 1 following the CLOSED season's
+      // own start (Round 10) — computed from seasonStart itself, not
+      // from whatever calendar year the close happens to land in, so a
+      // season closed late (or in a test fixture set in the past) still
+      // rolls to ITS next January 1.
+      const closedStartMs = Date.parse(state.league.seasonStart);
+      if (Number.isFinite(closedStartMs)) {
+        const nextStart = new Date(closedStartMs);
+        nextStart.setUTCFullYear(nextStart.getUTCFullYear() + 1);
+        state.league.seasonStart = nextStart.toISOString();
+      } else {
+        const y = new Date().getUTCFullYear();
+        state.league.seasonStart = `${y + 1}-01-01T05:00:00.000Z`;
+      }
       state.league.phase = 'setup';
       state.league.markedManId = lastMan.id; // champion starts next season marked (champion's privilege: he also picks platform/class via settings)
       state.league.scrimmage = false;
@@ -1381,12 +1601,21 @@ async function api(req, res, url) {
 
 // ── static PWA ───────────────────────────────────────────────────────────────
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.mp4': 'video/mp4', '.ico': 'image/x-icon' };
+// HTML/JS/CSS (and the manifest) are the app itself: after a redeploy
+// they must never be served stale from a browser cache, or members run
+// last week's client against this week's server (Round 10). Media and
+// other assets keep default caching.
+const NO_CACHE_EXTS = new Set(['.html', '.js', '.css', '.webmanifest']);
 function serveStatic(req, res, url) {
   let p = url.pathname === '/' ? '/index.html' : url.pathname;
   const file = path.join(__dirname, 'public', path.normalize(p).replace(/^(\.\.[\/\\])+/, ''));
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    const ext = path.extname(file);
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      ...(NO_CACHE_EXTS.has(ext) ? { 'Cache-Control': 'no-cache' } : {}),
+    });
     res.end(data);
   });
 }
