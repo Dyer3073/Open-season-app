@@ -358,7 +358,15 @@ function renderAlerts() {
 async function testPush() {
   try {
     const r = await api('/api/push/test', 'POST', {});
-    toast(`Test push sent — ${r.accepted} of ${r.targeted} subscription${r.targeted === 1 ? '' : 's'} accepted. Check your notifications.`);
+    const noun = `subscription${r.targeted === 1 ? '' : 's'}`;
+    if (r.accepted === r.targeted) {
+      toast(`Test push sent — ${r.accepted} of ${r.targeted} ${noun} accepted. Check your notifications.`);
+    } else {
+      // Round 8: name the push service's actual verdicts (e.g. 403, 403)
+      // so a rejection is diagnosable from the toast alone.
+      const codes = (r.statuses || []).join(', ');
+      toast(`Test push sent — ${r.accepted} of ${r.targeted} ${noun} accepted (push service said: ${codes}). Check your notifications.`);
+    }
   } catch (e) { toast(e.message); }
 }
 async function toggleAlerts(on) {
@@ -368,6 +376,17 @@ async function toggleAlerts(on) {
     if (on) {
       const perm = await Notification.requestPermission();
       if (perm !== 'granted') throw new Error('Notifications are blocked for this app');
+      // Round 8: force a FRESH subscription. An existing one may have been
+      // minted against an older server VAPID key (subscriptions outlive the
+      // keys when hosting rotates them) — every send to it is then rejected
+      // with 403 while it looks perfectly alive. Drop it first (server-side
+      // too, best effort) so subscribe() binds the stored subscription to
+      // the server's CURRENT public key.
+      const existing = await reg.pushManager.getSubscription();
+      if (existing) {
+        try { await api('/api/push/unsubscribe', 'POST', { endpoint: existing.endpoint }); } catch (_) { /* best effort */ }
+        try { await existing.unsubscribe(); } catch (_) { /* best effort */ }
+      }
       const { publicKey } = await api('/api/push/key');
       const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(publicKey) });
       await api('/api/push/subscribe', 'POST', { subscription: sub.toJSON() });

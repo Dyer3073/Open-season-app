@@ -710,7 +710,13 @@ async function api(req, res, url) {
       body: "Test push — notifications are working. You're all set.",
       tag: 'test-push',
     }, save);
-    return json(res, 200, { ok: true, targeted: r.targeted, accepted: r.accepted, pruned: r.pruned });
+    // Round 8 diagnostics: surface the push service's per-attempt HTTP
+    // statuses (and error notes for sends that never got an answer) so a
+    // rejected test push is decisive evidence, not just "0 accepted".
+    return json(res, 200, {
+      ok: true, targeted: r.targeted, accepted: r.accepted, pruned: r.pruned,
+      statuses: r.statuses, ...(r.errors && r.errors.length ? { errors: r.errors } : {}),
+    });
   }
 
   if (method === 'POST' && url.pathname === '/api/messages') {

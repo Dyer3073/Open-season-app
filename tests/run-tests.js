@@ -47,11 +47,22 @@
 // scheduler tick is env-shortened to 300 ms; call timelines are driven
 // by doctoring stored timestamps through backup/restore.
 //
+// Round 8 adds Suite 10: the push hotfix — the test push now reports the
+// push service's per-attempt HTTP statuses (a status 0 carries an error
+// note), a 403 prunes a subscription like 404/410 (a VAPID rejection for
+// that subscription is permanent), the default VAPID subject is the app's
+// real https origin instead of a mailto at a fake local domain, payload
+// decryption is re-verified with a second, independently written routine
+// (hand-rolled HKDF, explicit 0x02-delimiter assertion), and the VAPID
+// JWT is asserted end-to-end for an Apple-shaped endpoint (aud, exp
+// window, sub, ES256 signature) in an isolated subprocess. Sends stay on
+// localhost; the Apple-shaped check only mints a JWT, it sends nothing.
+//
 // Run:  node tests/run-tests.js
 // Spawns throwaway servers on scratch ports with temp DATA_DIRs. No network
 // beyond localhost. Exits non-zero if any check fails.
 
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -1278,6 +1289,140 @@ async function suiteRound7() {
   } finally { s2.child.kill(); }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Round 8 second opinion — decrypt a push body WITHOUT the shared
+// decryptPush helper above: HKDF is expanded by hand (HMAC extract/expand
+// per RFC 5869) straight from the RFC 8291 recipe, and the record padding
+// delimiter is asserted explicitly instead of being stripped on faith. A
+// bug shared between lib/push.js's hkdfSync usage and decryptPush's
+// mirror of it cannot hide from this routine — that is the point of it.
+function decryptPushFresh(body, ctx) {
+  const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
+  const hkdf = (salt, ikm, info, len) => {
+    const prk = hmac(salt, ikm); // HKDF-Extract
+    let okm = Buffer.alloc(0), t = Buffer.alloc(0), counter = 0;
+    while (okm.length < len) { t = hmac(prk, Buffer.concat([t, info, Buffer.from([++counter])])); okm = Buffer.concat([okm, t]); }
+    return okm.subarray(0, len);
+  };
+  const salt = body.subarray(0, 16);
+  const rs = body.readUInt32BE(16);
+  const idlen = body[20];
+  const asPub = body.subarray(21, 21 + idlen);
+  const ct = body.subarray(21 + idlen);
+  const asKeyObj = crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: asPub.subarray(1, 33).toString('base64url'), y: asPub.subarray(33, 65).toString('base64url') }, format: 'jwk' });
+  const ecdhSecret = crypto.diffieHellman({ privateKey: ctx.privateKey, publicKey: asKeyObj });
+  const keyInfo = Buffer.concat([Buffer.from('WebPush: info\0', 'utf8'), ctx.uaPoint, asPub]);
+  const ikm = hkdf(ctx.auth, ecdhSecret, keyInfo, 32);
+  const cek = hkdf(salt, ikm, Buffer.from('Content-Encoding: aes128gcm\0', 'utf8'), 16);
+  const nonce = hkdf(salt, ikm, Buffer.from('Content-Encoding: nonce\0', 'utf8'), 12);
+  const decipher = crypto.createDecipheriv('aes-128-gcm', cek, nonce, { authTagLength: 16 });
+  decipher.setAuthTag(ct.subarray(ct.length - 16));
+  const plain = Buffer.concat([decipher.update(ct.subarray(0, ct.length - 16)), decipher.final()]);
+  return { plain, rs };
+}
+
+async function suitePushHotfix() {
+  suite('Suite 10 — push hotfix: status diagnostics, 403 pruning, independent decrypt, Apple-shaped VAPID JWT (Round 8)');
+  const { child, base } = await startServer(3424, '2000-01-01T05:00:00.000Z');
+  const received = [];
+  const fake = http.createServer((rq, rs) => {
+    const chunks = [];
+    rq.on('data', c => chunks.push(c));
+    rq.on('end', () => {
+      received.push({ url: rq.url, headers: rq.headers, body: Buffer.concat(chunks) });
+      if (rq.url === '/push/forbidden') { rs.writeHead(403); rs.end('bad vapid token'); } // Apple's verdict for a sub our keys can't sign for
+      else { rs.writeHead(201); rs.end('ok'); }
+    });
+  });
+  await new Promise(r => fake.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${fake.address().port}`;
+  // A guaranteed-dead port for the network-error (status 0) case: bind one,
+  // learn its number, let it go — connecting afterwards is refused at once.
+  const deadSrv = http.createServer();
+  await new Promise(r => deadSrv.listen(0, '127.0.0.1', r));
+  const deadPort = deadSrv.address().port;
+  await new Promise(r => deadSrv.close(r));
+  try {
+    const tA = await claim(base, A), tB = await claim(base, B), tC = await claim(base, C);
+
+    // ── statuses: a clean send names the push service's 201 ──
+    const ctxA = makeSub(origin, '/push/ok-a');
+    await req(base, tA, 'POST', '/api/push/subscribe', { subscription: ctxA.sub });
+    let tp = await req(base, tA, 'POST', '/api/push/test', {});
+    check('statuses: a clean test push reports statuses [201] and no errors block',
+      tp.status === 200 && tp.json.accepted === 1 && Array.isArray(tp.json.statuses) &&
+      tp.json.statuses.length === 1 && tp.json.statuses[0] === 201 && tp.json.errors === undefined, tp.json);
+    const hitA = await waitForPush(received, m => m.url === '/push/ok-a');
+    check('statuses: A\'s push reached the fake push service', !!hitA, received.map(m => m.url));
+
+    // ── independent-vector decrypt of that very body ──
+    if (hitA) {
+      const dec = decryptPushFresh(hitA.body, ctxA);
+      check('independent decrypt: header rs is 4096 and the record ends with the 0x02 delimiter',
+        dec.rs === 4096 && dec.plain[dec.plain.length - 1] === 0x02,
+        { rs: dec.rs, lastByte: dec.plain[dec.plain.length - 1] });
+      const note = JSON.parse(dec.plain.subarray(0, dec.plain.length - 1).toString('utf8'));
+      check('independent decrypt: plaintext round-trips to the canned test notification',
+        note.tag === 'test-push' && note.title === '🏹 Open Season' && /Test push/.test(note.body), note);
+    }
+
+    // ── 403 prunes like 410 — and stays pruned ──
+    const ctxOkB = makeSub(origin, '/push/ok-b'), ctxBadB = makeSub(origin, '/push/forbidden');
+    await req(base, tB, 'POST', '/api/push/subscribe', { subscription: ctxOkB.sub });
+    await req(base, tB, 'POST', '/api/push/subscribe', { subscription: ctxBadB.sub });
+    tp = await req(base, tB, 'POST', '/api/push/test', {});
+    check('403 prune: B targets 2 — 1 accepted, 1 pruned, and the statuses name the 403',
+      tp.status === 200 && tp.json.targeted === 2 && tp.json.accepted === 1 && tp.json.pruned === 1 &&
+      Array.isArray(tp.json.statuses) && tp.json.statuses.includes(403) && tp.json.statuses.includes(201), tp.json);
+    tp = await req(base, tB, 'POST', '/api/push/test', {});
+    check('403 prune: the 403 subscription stays pruned — B now targets 1, all accepted',
+      tp.status === 200 && tp.json.targeted === 1 && tp.json.accepted === 1 && tp.json.pruned === 0 &&
+      tp.json.statuses.length === 1 && tp.json.statuses[0] === 201, tp.json);
+
+    // ── network failure: status 0 + an error note, and NOT pruned ──
+    const ctxDead = makeSub(`http://127.0.0.1:${deadPort}`, '/push/never');
+    await req(base, tC, 'POST', '/api/push/subscribe', { subscription: ctxDead.sub });
+    tp = await req(base, tC, 'POST', '/api/push/test', {});
+    check('status 0: an unreachable endpoint reports status 0 with an error note — not accepted, not pruned',
+      tp.status === 200 && tp.json.targeted === 1 && tp.json.accepted === 0 && tp.json.pruned === 0 &&
+      Array.isArray(tp.json.statuses) && tp.json.statuses[0] === 0 &&
+      Array.isArray(tp.json.errors) && tp.json.errors.length === 1 &&
+      typeof tp.json.errors[0] === 'string' && tp.json.errors[0].length > 0, tp.json);
+    tp = await req(base, tC, 'POST', '/api/push/test', {});
+    check('status 0: the unreachable subscription is kept — a transient failure is not death',
+      tp.status === 200 && tp.json.targeted === 1 && tp.json.statuses[0] === 0, tp.json);
+
+    // ── VAPID JWT for an Apple-shaped endpoint, minted in an isolated
+    // subprocess (its own DATA_DIR + keypair; nothing is sent anywhere) ──
+    const jwtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'os-vapid-'));
+    const script =
+      `const p = require(${JSON.stringify(path.join(APP_DIR, 'lib', 'push.js'))});` +
+      `console.log(JSON.stringify({ jwt: p.vapidJwt('https://web.push.apple.com/TESTTOKEN'), publicKey: p.vapid().publicKey, subject: p.vapid().subject }));`;
+    const cleanEnv = { ...process.env, DATA_DIR: jwtDir };
+    delete cleanEnv.VAPID_PUBLIC_KEY; delete cleanEnv.VAPID_PRIVATE_KEY; delete cleanEnv.VAPID_SUBJECT;
+    let info = null;
+    try { info = JSON.parse(execFileSync('node', ['-e', script], { env: cleanEnv, encoding: 'utf8' }).trim()); } catch (e) { /* asserted below */ }
+    check('vapid: an isolated keypair mints a JWT for an Apple-shaped endpoint', !!info && typeof info.jwt === 'string', info && info.jwt && info.jwt.slice(0, 24));
+    if (info) {
+      const [h, pl, sg] = info.jwt.split('.');
+      const claims = JSON.parse(Buffer.from(pl, 'base64url').toString());
+      const nowS = Math.floor(Date.now() / 1000);
+      check('vapid: aud is exactly the Apple push origin', claims.aud === 'https://web.push.apple.com', claims);
+      check('vapid: exp sits inside (now, now + 24h]', claims.exp > nowS && claims.exp <= nowS + 24 * 3600, { exp: claims.exp, now: nowS });
+      check('vapid: sub is the real https origin default — no fake mailto domain',
+        claims.sub === 'https://open-season.onrender.com' && info.subject === 'https://open-season.onrender.com', claims.sub);
+      const pubBytes = Buffer.from(info.publicKey, 'base64url');
+      const keyObj = crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: pubBytes.subarray(1, 33).toString('base64url'), y: pubBytes.subarray(33, 65).toString('base64url') }, format: 'jwk' });
+      check('vapid: the ES256 signature verifies against the served public key (ieee-p1363)',
+        crypto.verify('sha256', Buffer.from(`${h}.${pl}`), { key: keyObj, dsaEncoding: 'ieee-p1363' }, Buffer.from(sg, 'base64url')) === true);
+      let info2 = null;
+      try { info2 = JSON.parse(execFileSync('node', ['-e', script], { env: { ...cleanEnv, VAPID_SUBJECT: 'mailto:admin@example.org' }, encoding: 'utf8' }).trim()); } catch (e) { /* asserted below */ }
+      const claims2 = info2 ? JSON.parse(Buffer.from(info2.jwt.split('.')[1], 'base64url').toString()) : {};
+      check('vapid: VAPID_SUBJECT env still wins over the new default', claims2.sub === 'mailto:admin@example.org', claims2.sub);
+    }
+  } finally { child.kill(); fake.close(); }
+}
+
 (async () => {
   try {
     await suiteSetup();
@@ -1289,6 +1434,7 @@ async function suiteRound7() {
     await suiteRound5();
     await suiteHuntMode();
     await suiteRound7();
+    await suitePushHotfix();
   } catch (e) { failed++; console.error('\nSUITE ERROR:', e); }
   console.log(`\n════ RESULT: ${passed} passed, ${failed} failed ════`);
   process.exit(failed ? 1 : 0);
