@@ -42,6 +42,9 @@
     <div class="brand">◎ OPEN SEASON</div>
     <div id="seasonLine" class="season-line"></div>
     <div id="countdown" class="countdown"></div>
+    <div id="scrimmageBanner" class="scrimmage-banner" hidden>🏋 SCRIMMAGE — practice, nothing counts</div>
+    <div id="huntBanner" class="hunt-banner" hidden></div>
+    <div id="checkBanner" class="check-banner" hidden></div>
     <div id="meBar" class="me-bar"></div>
   </header>
 
@@ -82,11 +85,17 @@
 
     <!-- BOARD -->
     <div class="pane" id="pane-board" hidden>
+      <button class="ghost" onclick="copyInvite()">📋 Copy invite message for the group chat</button>
+      <div id="checkBoard"></div>
       <div id="actionCenter"></div>
       <h3>Hunt Board — Season <span class="seasonNum"></span></h3>
       <div id="huntBoard"></div>
+      <h3>💰 Bounty Board</h3>
+      <div id="bountyBoard"></div>
       <h3>Career XP Leaderboard</h3>
       <div id="careerBoard"></div>
+      <h3>⚰ Hall of the Fallen — past seasons</h3>
+      <div id="hallList"></div>
     </div>
 
     <!-- CHAT -->
@@ -98,6 +107,8 @@
           <label class="check"><input type="checkbox" id="killStealth"> Stealth</label>
           <button id="killBtn" class="primary small">Claim</button>
         </div>
+        <label>Proof photo <span class="hint">(optional — JPEG/PNG/WebP, under 2.5 MB)</span></label>
+        <input id="killPhoto" type="file" accept="image/jpeg,image/png,image/webp">
         <p id="killNote" class="hint"></p>
       </div>
       <div id="feed"></div>
@@ -109,8 +120,12 @@
 
     <!-- MY CARD -->
     <div class="pane" id="pane-me" hidden>
+      <div id="huntCard"></div>
+      <div id="pingCard"></div>
+      <div id="setupChecklist"></div>
       <div id="myCard"></div>
-      <div class="card" id="reversePanel"></div>
+      <div class="card" id="cancelPanel"></div>
+      <div class="card" id="alertsCard"></div>
       <button id="logoutBtn" class="ghost">Log out</button>
     </div>
 
@@ -121,6 +136,21 @@
     </div>
   </main>
 </section>
+
+<!-- ── Overlay sheet (profiles / rank list) ── -->
+<div id="overlay" hidden>
+  <div class="sheet">
+    <button id="overlayClose" class="ghost small">✕ Close</button>
+    <div id="overlayBody"></div>
+  </div>
+</div>
+
+<!-- ── First-open walkthrough ── -->
+<div id="walkthrough" hidden>
+  <div class="sheet">
+    <div id="walkBody"></div>
+  </div>
+</div>
 
 <div id="toast" hidden></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

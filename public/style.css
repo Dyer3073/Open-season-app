@@ -68,4 +68,78 @@ th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px
 .action button{margin:6px 6px 0 0;width:auto}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--orange);color:#000;font-weight:700;padding:12px 18px;border-radius:99px;z-index:50;max-width:92vw;text-align:center}
 .leaflet-container{background:#111}
+.leaflet-tile-pane img{filter:invert(1) hue-rotate(185deg) brightness(.82) contrast(.92) saturate(.55)}
 .big{font-size:22px;font-weight:900}
+/* ── upgrade: insignia, profiles, achievements, bounties, overlays ── */
+.insignia{vertical-align:-4px;flex:0 0 auto}
+.badge.rank.chip{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 5px}
+.badge.rank.chip .insignia{vertical-align:0}
+.tappable{cursor:pointer}
+tr.tappable:hover td,.hunter.tappable:hover{background:var(--panel2)}
+.hunter.stale{opacity:.55}
+.bounty-badge{background:#3a2400;color:var(--orange2);border:1px solid var(--orange);font-size:11px;padding:2px 8px;border-radius:99px;font-weight:800;white-space:nowrap}
+.scrimmage-banner{background:var(--orange);color:#000;font-weight:900;letter-spacing:1px;text-align:center;border-radius:10px;padding:8px;margin-top:8px;font-size:13px}
+.backup-warn{border:2px solid #ffd23e;background:linear-gradient(180deg,#2a2400,#1a1400);border-radius:14px;padding:12px;margin:12px 0;font-weight:600}
+.msg.banner{border:2px solid var(--orange);background:linear-gradient(180deg,#2a1600,#1a0e00);font-size:15px;font-weight:600;text-align:left;padding:12px}
+.msg.banner .who{color:var(--orange)}
+.msg.duck.banner{border-color:#ffd23e;background:linear-gradient(180deg,#2a2400,#1a1400)}
+.msg.achievement.banner{border-color:#ffb066;background:linear-gradient(180deg,#331b00,#1d1000)}
+.profile-head{display:flex;gap:14px;align-items:flex-start}
+.profile-head .big{line-height:1.1}
+.statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 6px;text-align:center}
+.stat b{display:block;font-size:18px;color:var(--orange2)}
+.stat span{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.achvgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}
+.achv{border:1px solid var(--line);border-radius:10px;padding:9px 10px;background:var(--panel2)}
+.achv b{display:block;font-size:13px}
+.achv span{font-size:11.5px;color:var(--muted)}
+.achv.earned{border-color:var(--orange);background:#241300}
+.achv.locked{opacity:.55}
+.rankrow{display:flex;gap:12px;align-items:center;padding:9px 8px;border-bottom:1px solid var(--line)}
+.rankrow.mine{background:#241300;border:1px solid var(--orange);border-radius:10px}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:60;overflow-y:auto;padding:18px 10px}
+#overlay .sheet{background:var(--bg);border:1px solid var(--orange);border-radius:16px;max-width:560px;margin:0 auto;padding:14px}
+#overlayClose{width:auto;float:right;margin:0 0 8px}
+.check-item{margin:7px 0;font-size:14px}
+.slim-ok{color:var(--green);font-weight:700;text-align:center}
+.msg .who .insignia{vertical-align:-2px}
+/* ── round 2: kill cancel, immunity, photos, reactions, callsigns ── */
+.shield{color:#7dd87d;font-weight:800;font-size:12px;white-space:nowrap}
+.avatar{line-height:1}
+.msg.cancel.banner{border-color:#7dd87d;background:linear-gradient(180deg,#0f2a12,#0a1a0c)}
+.msg.danger{border-color:var(--red);color:#ffb3b5}
+.msg.danger.banner{background:linear-gradient(180deg,#2a0d0e,#1a0809)}
+.proof{max-width:100%;max-height:320px;border-radius:10px;border:1px solid var(--line);margin-top:8px}
+.reacts{display:flex;gap:6px;margin-top:7px}
+.react{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:99px;padding:3px 10px;font-size:13px;font-weight:600;width:auto;margin:0}
+.react.mine{border-color:var(--orange);background:#2a1600}
+.killhist{padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.emoji-grid{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.emoji-pick{background:var(--panel2);border:1px solid var(--line);border-radius:10px;font-size:20px;padding:6px 9px;width:auto;margin:0}
+.emoji-pick.mine{border-color:var(--orange);background:#2a1600}
+/* ── round 4: safe-zone announcements + driving mode ── */
+.msg.safezone{border-color:#7dd87d}
+.msg.safezone.banner{background:linear-gradient(180deg,#12260f,#0b150a)}
+.msg.driving{border-color:#8ab4ff}
+.msg.driving.banner{border-color:#8ab4ff;background:linear-gradient(180deg,#0d1a2e,#0a111f)}
+/* ── round 6: hunt mode ── */
+.hunt-banner{background:var(--red);color:#fff;font-weight:900;letter-spacing:1px;text-align:center;border-radius:10px;padding:9px;margin-top:8px;font-size:14px;animation:huntpulse 1.6s ease-in-out infinite}
+@keyframes huntpulse{0%,100%{opacity:1}50%{opacity:.7}}
+.hunting-badge{background:#3a0d0e;color:#ffb3b5;border:1px solid var(--red);font-size:11px;padding:2px 8px;border-radius:99px;font-weight:800;white-space:nowrap}
+.hunt-card.on{border-color:var(--red);background:linear-gradient(180deg,#2a0d0e,#160a0b)}
+.msg.hunt{border-color:var(--red)}
+.msg.hunt.banner{background:linear-gradient(180deg,#2a0d0e,#1a0809)}
+/* ── round 7: league ping + location check ── */
+.check-banner{background:#a35b00;color:#fff;font-weight:800;letter-spacing:.4px;text-align:center;border-radius:10px;padding:9px;margin-top:8px;font-size:14px}
+.msg.ping{border-color:#ffb066}
+.msg.ping.banner{background:linear-gradient(180deg,#331b00,#1d1000)}
+.msg.check{border-color:#ffd23e}
+.msg.check.banner{background:linear-gradient(180deg,#2a2400,#1a1400)}
+.pin.hunting{box-shadow:0 0 0 3px rgba(229,72,77,.6),0 0 12px rgba(229,72,77,.55)}
+video.tutorial{width:100%;border-radius:12px;border:1px solid var(--line);background:#000}
+#walkthrough{position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:70;overflow-y:auto;padding:18px 10px}
+#walkthrough .sheet{background:var(--bg);border:1px solid var(--orange);border-radius:16px;max-width:560px;margin:0 auto;padding:16px}
+.walkcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin:10px 0}
+.walkcard p{margin:6px 0 0;font-size:14px;color:var(--text)}
+.pin{font-size:15px}
